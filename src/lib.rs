@@ -1,15 +1,16 @@
 //! Secrets for ikigai (`urn:secret:*`): resolve and store secrets through the OS
 //! keystore, capability-gated.
 //!
-//! Slice 1 (here): a named-secret **store** — the macOS **Keychain**
-//! (`Security.framework`) on a Mac, a dev **file backend** everywhere else — behind a
-//! [`Backend`] trait, plus a capability-gated **read face** `urn:secret:{name}`
-//! (`Source`). Secrets are never cached. The write/delete faces and a Touch-ID unlock
-//! session (`urn:secret:unlock`, `LAContext`) are a later slice; the [`Backend`] trait
-//! already exposes get/set/delete for a host (e.g. a relying party's credential store).
+//! - A named-secret **store** — the macOS **Keychain** (`Security.framework`) on a Mac,
+//!   a dev **file backend** everywhere else — behind a [`Backend`] trait, plus a
+//!   capability-gated **read face** `urn:secret:{name}` (`Source`). Secrets are never
+//!   cached. The trait exposes get/set/delete for a host (e.g. a relying party's
+//!   credential store); write/delete *over the wire* are a later slice.
+//! - A **biometric gate**: [`require_biometric`] (macOS Touch ID via `LAContext`, a
+//!   no-op elsewhere) and the resource `urn:secret:unlock`, so a host can require
+//!   physical presence for a sensitive operation (e.g. enrolling a passkey).
 //!
-//! Scopes: `urn:cap:secret:read:<name>` (default-deny). A holder can only read a secret
-//! its capability names.
+//! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:unlock`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,6 +59,39 @@ pub fn default_space() -> EndpointSpace {
     space(default_backend())
 }
 
+/// Require biometric presence (Touch ID) for a sensitive operation, showing `reason` in
+/// the prompt. **macOS only** — a no-op on other platforms (the gate is a Mac-deployment
+/// property). Blocks until the user responds. `Err(Denied)` if the check fails.
+pub fn require_biometric(reason: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use robius_authentication::{
+            AndroidText, BiometricStrength, Context, PolicyBuilder, Text, WindowsText,
+        };
+        let policy = PolicyBuilder::new()
+            .biometrics(Some(BiometricStrength::Strong))
+            .build()
+            .ok_or_else(|| Error::Endpoint("no biometric policy available".into()))?;
+        let text = Text {
+            android: AndroidText {
+                title: reason,
+                subtitle: None,
+                description: None,
+            },
+            apple: reason,
+            windows: WindowsText::new_truncated(reason, reason),
+        };
+        Context::new(())
+            .blocking_authenticate(text, &policy)
+            .map_err(|e| Error::Denied(format!("biometric check failed: {e:?}")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = reason;
+        Ok(())
+    }
+}
+
 /// `urn:secret:{name}` — read a secret, capability-gated. Write/delete over the wire are
 /// a later slice; a host writes through the [`Backend`] directly for now.
 struct SecretEndpoint {
@@ -72,6 +106,23 @@ impl Endpoint for SecretEndpoint {
             .get("name")
             .map(|s| s.to_string())
             .ok_or_else(|| Error::MissingArgument("name".into()))?;
+        // `urn:secret:unlock` is a reserved operation, not a stored secret: prove
+        // biometric presence (Touch ID), capability-gated by `urn:cap:secret:unlock`.
+        if name == "unlock" {
+            if inv.request.verb != Verb::Source {
+                return Err(Error::Endpoint("urn:secret:unlock is a Source".into()));
+            }
+            if !inv.capability.allows("urn:cap:secret:unlock") {
+                return Err(Error::Denied(
+                    "unlock requires `urn:cap:secret:unlock`".into(),
+                ));
+            }
+            require_biometric("Unlock ikigai secrets")?;
+            return Ok(Representation::new(
+                ReprType::new("text/plain"),
+                b"unlocked".to_vec(),
+            ));
+        }
         match inv.request.verb {
             Verb::Source => {
                 let scope = format!("urn:cap:secret:read:{name}");
@@ -266,5 +317,22 @@ mod tests {
         )
         .expect("granted read resolves");
         assert_eq!(repr.bytes, b"sk-123");
+    }
+
+    #[test]
+    fn unlock_is_capability_gated_before_the_biometric_prompt() {
+        // The cap check runs before `require_biometric`, so this is denied without a
+        // prompt (a granted unlock would prompt for Touch ID — not testable in CI).
+        let dir = tempfile::tempdir().unwrap();
+        let kernel =
+            ikigai_core::Kernel::new(Arc::new(space(Arc::new(FileBackend::new(dir.path())))));
+        let req = Request::new(
+            Verb::Source,
+            ikigai_core::Iri::parse("urn:secret:unlock").unwrap(),
+        );
+        assert!(
+            Resolver::issue_as(&kernel, req, &Capability::scoped(Vec::<String>::new())).is_err(),
+            "unlock without `urn:cap:secret:unlock` is denied"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -20,6 +20,9 @@ async-trait = "0.1"
 # platforms, which fall back to the dev file store.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+# Touch ID for `urn:secret:unlock` / `require_biometric` (LocalAuthentication, sync).
+# macOS-gated: off it, the gate is a no-op (a Mac-deployment property).
+robius-authentication = "0.1"
 
 [dev-dependencies]
 # Resolver::issue_as drives the capability-gating test.
