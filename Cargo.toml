@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -15,6 +15,18 @@ categories = ["os"]
 ikigai-core = "0.1.46"
 # Endpoint::invoke is async (dyn via async-trait).
 async-trait = "0.1"
+
+# Ed25519 key generation for `urn:secret:generate`. PKCS8 (private) + SPKI (public)
+# PEM encoding — the same standard encodings ikigai-sign reads via `key=urn:secret:<name>`.
+# Cross-platform (native); no wasm face needed for this module.
+ed25519-dalek = { version = "2.1", default-features = false, features = [
+    "std",
+    "pkcs8",
+    "pem",
+    "rand_core",
+] }
+# OsRng for the key material (rand_core 0.6, the version ed25519-dalek 2.1 links).
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # The macOS Keychain backend (Security.framework generic passwords). Gated off other
 # platforms, which fall back to the dev file store.
