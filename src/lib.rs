@@ -152,10 +152,10 @@ impl Endpoint for SecretEndpoint {
             ));
         }
         // `urn:secret:generate` is a reserved operation, not a stored secret: mint a
-        // keypair. The URI slot `{name}` is taken by the literal `generate`, so the key
-        // name arrives as the by-value argument `name=<keyname>` (`type=ed25519`, the
-        // only kind for now). Cap-gate FIRST (default-deny, no side effect without it),
-        // then prove biometric presence, then generate and store.
+        // keypair. The URI slot `{name}` is already bound to the literal `generate`, so the
+        // key name arrives as a DISTINCT by-value argument `into=<keyname>` — NOT `name`,
+        // which the template has taken. `type=ed25519` is the only kind for now. Cap-gate
+        // FIRST (default-deny, no side effect without it), then prove biometric, then store.
         if name == "generate" {
             if inv.request.verb != Verb::Source {
                 return Err(Error::Endpoint("urn:secret:generate is a Source".into()));
@@ -165,7 +165,7 @@ impl Endpoint for SecretEndpoint {
                     "generate requires `urn:cap:secret:generate`".into(),
                 ));
             }
-            let key = inv.inline_str("name")?.to_string();
+            let key = inv.inline_str("into")?.to_string();
             let kind = if inv.request.args.contains_key("type") {
                 inv.inline_str("type")?
             } else {
@@ -225,16 +225,21 @@ impl Endpoint for SecretEndpoint {
                 "Read a secret from the OS keystore (macOS Keychain), capability-gated by \
                  `urn:cap:secret:read:<name>`. Reserved ops (Source): `urn:secret:unlock` \
                  (biometric presence, `urn:cap:secret:unlock`) and `urn:secret:generate` \
-                 (mint an Ed25519 keypair — `name=<keyname>` `type=ed25519`; \
+                 (mint an Ed25519 keypair — `into=<keyname>` `type=ed25519`; \
                  `urn:cap:secret:generate` + biometric; stores private PKCS8-PEM under \
-                 `<name>` and public SPKI-PEM under `<name>.pub`, returns the public key). \
+                 `<into>` and public SPKI-PEM under `<into>.pub`, returns the public key). \
                  Never cached.",
             )
             .verb(Verb::Source)
             .input(
                 ArgSpec::new("name")
-                    .summary("secret name to read, or the key name to mint for `generate`")
+                    .summary("the secret to read (the `{name}` URI slot)")
                     .binding(),
+            )
+            .input(
+                ArgSpec::new("into")
+                    .summary("`generate`: the key name to mint into (private at `<into>`, public at `<into>.pub`)")
+                    .optional(),
             )
             .input(
                 ArgSpec::new("type")
@@ -426,7 +431,7 @@ mod tests {
             Verb::Source,
             ikigai_core::Iri::parse("urn:secret:generate").unwrap(),
         )
-        .with_arg("name", ikigai_core::ArgRef::Inline(key.as_bytes().to_vec()))
+        .with_arg("into", ikigai_core::ArgRef::Inline(key.as_bytes().to_vec()))
     }
 
     // Keygen itself is cross-platform and gate-free — unit-test it directly, so the
