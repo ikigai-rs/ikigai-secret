@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -27,6 +27,11 @@ ed25519-dalek = { version = "2.1", default-features = false, features = [
 ] }
 # OsRng for the key material (rand_core 0.6, the version ed25519-dalek 2.1 links).
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# `age` X25519 keygen for `urn:secret:generate type=age` — the ENCRYPTION keypair, dual of
+# the ed25519 signing key, whose identity/recipient strings `ikigai-encrypt` consumes as
+# `key=`/`to=`. Only the x25519 keygen is used (no armor/encrypt here), so default-features off.
+age = { version = "0.11", default-features = false }
 
 # The macOS Keychain backend (Security.framework generic passwords). Gated off other
 # platforms, which fall back to the dev file store.

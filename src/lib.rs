@@ -9,12 +9,13 @@
 //! - A **biometric gate**: [`require_biometric`] (macOS Touch ID via `LAContext`, a
 //!   no-op elsewhere) and the resource `urn:secret:unlock`, so a host can require
 //!   physical presence for a sensitive operation (e.g. enrolling a passkey).
-//! - **Key generation**: the reserved operation `urn:secret:generate` (`name=<keyname>`,
-//!   `type=ed25519`) mints an Ed25519 keypair, storing the private key as **PKCS8-PEM**
-//!   under `<name>` and the public key as **SPKI-PEM** under `<name>.pub`, and returns
-//!   the public key. Cap-gated (`urn:cap:secret:generate`) and biometric-gated. The
-//!   private key never leaves through this op — it is retrieved separately through the
-//!   cap-gated read face (the same PKCS8-PEM `ikigai-sign` reads via `key=urn:secret:<name>`).
+//! - **Key generation**: the reserved operation `urn:secret:generate` (`into=<keyname>`,
+//!   `type=ed25519`|`age`) mints a keypair — an **Ed25519** signing key (PKCS8/SPKI PEM,
+//!   read by `ikigai-sign`) or an **`age`** X25519 encryption key (identity/recipient, read
+//!   by `ikigai-encrypt`) — storing the private half under `<name>` and the public half
+//!   under `<name>.pub`, and returning the public half. Cap-gated (`urn:cap:secret:generate`)
+//!   and biometric-gated; the private key never leaves through this op (retrieved separately
+//!   through the cap-gated read face). One identity, two keys: sign *and* encrypt.
 //!
 //! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:unlock`,
 //! `urn:cap:secret:generate`.
@@ -120,6 +121,18 @@ fn generate_ed25519() -> Result<(String, String)> {
     Ok((pkcs8.to_string(), spki))
 }
 
+/// Mint a fresh `age` X25519 keypair, returning `(identity, recipient)` — the private
+/// identity as `AGE-SECRET-KEY-1…` and the public recipient as `age1…`, the exact strings
+/// `ikigai-encrypt`'s `key=`/`to=` resources consume. The encryption dual of the ed25519
+/// signing key; one identity, two keys (sign + encrypt), both custodied here.
+fn generate_age() -> (String, String) {
+    use age::secrecy::ExposeSecret;
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public().to_string();
+    let secret = identity.to_string().expose_secret().to_string();
+    (secret, recipient)
+}
+
 /// `urn:secret:{name}` — read a secret, capability-gated. Write/delete over the wire are
 /// a later slice; a host writes through the [`Backend`] directly for now.
 struct SecretEndpoint {
@@ -154,8 +167,8 @@ impl Endpoint for SecretEndpoint {
         // `urn:secret:generate` is a reserved operation, not a stored secret: mint a
         // keypair. The URI slot `{name}` is already bound to the literal `generate`, so the
         // key name arrives as a DISTINCT by-value argument `into=<keyname>` — NOT `name`,
-        // which the template has taken. `type=ed25519` is the only kind for now. Cap-gate
-        // FIRST (default-deny, no side effect without it), then prove biometric, then store.
+        // which the template has taken. `type=ed25519` (signing, default) or `age`
+        // (encryption). Cap-gate FIRST (default-deny), then prove biometric, then store.
         if name == "generate" {
             if inv.request.verb != Verb::Source {
                 return Err(Error::Endpoint("urn:secret:generate is a Source".into()));
@@ -171,25 +184,42 @@ impl Endpoint for SecretEndpoint {
             } else {
                 "ed25519"
             };
-            if kind != "ed25519" {
-                return Err(Error::InvalidArgument {
-                    name: "type".into(),
-                    detail: format!("unsupported key type `{kind}` (only `ed25519`)"),
-                });
+            // Private key → `<name>`; public key → `<name>.pub`; the endpoint returns the
+            // PUBLIC half (private is retrieved separately through the cap-gated read face).
+            // Not cacheable (mutating + fresh randomness): the default, nothing to opt into.
+            match kind {
+                // `ed25519` — the SIGNING keypair (PKCS8/SPKI PEM), read by ikigai-sign.
+                "ed25519" => {
+                    require_biometric(&format!("Generate signing key {key}"))?;
+                    let (pkcs8_pem, spki_pem) = generate_ed25519()?;
+                    self.backend.set(&key, pkcs8_pem.as_bytes())?;
+                    self.backend
+                        .set(&format!("{key}.pub"), spki_pem.as_bytes())?;
+                    return Ok(Representation::new(
+                        ReprType::new("application/x-pem-file"),
+                        spki_pem.into_bytes(),
+                    ));
+                }
+                // `age` — the ENCRYPTION keypair (X25519 identity/recipient), read by
+                // ikigai-encrypt. The dual of the signing key: one identity, two keys.
+                "age" => {
+                    require_biometric(&format!("Generate encryption key {key}"))?;
+                    let (identity, recipient) = generate_age();
+                    self.backend.set(&key, identity.as_bytes())?;
+                    self.backend
+                        .set(&format!("{key}.pub"), recipient.as_bytes())?;
+                    return Ok(Representation::new(
+                        ReprType::new("text/plain"),
+                        recipient.into_bytes(),
+                    ));
+                }
+                other => {
+                    return Err(Error::InvalidArgument {
+                        name: "type".into(),
+                        detail: format!("unsupported key type `{other}` (use ed25519 or age)"),
+                    });
+                }
             }
-            require_biometric(&format!("Generate signing key {key}"))?;
-            let (pkcs8_pem, spki_pem) = generate_ed25519()?;
-            // Private key → `<name>` (PKCS8-PEM); public key → `<name>.pub` (SPKI-PEM).
-            self.backend.set(&key, pkcs8_pem.as_bytes())?;
-            self.backend
-                .set(&format!("{key}.pub"), spki_pem.as_bytes())?;
-            // Output is the PUBLIC key only — for distribution to verifiers. The private
-            // key is retrieved separately through the cap-gated read face. Not cacheable
-            // (mutating + fresh randomness): the default, so nothing to opt into.
-            return Ok(Representation::new(
-                ReprType::new("application/x-pem-file"),
-                spki_pem.into_bytes(),
-            ));
         }
         match inv.request.verb {
             Verb::Source => {
@@ -243,11 +273,14 @@ impl Endpoint for SecretEndpoint {
             )
             .input(
                 ArgSpec::new("type")
-                    .summary("`generate` key type (only `ed25519`)")
+                    .summary("`generate` key type: `ed25519` (signing, default) or `age` (encryption)")
+                    .one_of(["ed25519", "age"])
+                    .default_value("ed25519")
                     .optional(),
             )
             .output("application/octet-stream")
             .output("application/x-pem-file")
+            .output("text/plain")
     }
 }
 
@@ -438,6 +471,24 @@ mod tests {
     // "the pair matches" guarantee holds headless everywhere. The endpoint's biometric
     // gate is a REAL Touch ID prompt on macOS (only a no-op off it), so the granted
     // endpoint path is exercised on non-macOS below and validated on Brian's Mac by hand.
+    #[test]
+    fn generate_age_produces_a_matching_x25519_pair() {
+        use std::str::FromStr;
+        let (identity, recipient) = generate_age();
+        // The exact age formats `ikigai-encrypt` consumes as `key=`/`to=`.
+        assert!(
+            identity.starts_with("AGE-SECRET-KEY-1"),
+            "identity: {identity}"
+        );
+        assert!(recipient.starts_with("age1"), "recipient: {recipient}");
+        // The identity's public half IS the stored recipient (a real keypair).
+        let id = age::x25519::Identity::from_str(&identity).expect("valid age identity");
+        assert_eq!(id.to_public().to_string(), recipient);
+        // Fresh randomness: a second keygen differs.
+        let (other, _) = generate_age();
+        assert_ne!(identity, other);
+    }
+
     #[test]
     fn generate_ed25519_produces_a_matching_encoded_pair() {
         use ed25519_dalek::pkcs8::spki::DecodePublicKey;
