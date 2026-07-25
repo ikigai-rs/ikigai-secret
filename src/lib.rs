@@ -553,6 +553,8 @@ impl SecureEnclaveBackend {
         let found = ItemSearchOptions::new()
             .class(ItemClass::key())
             .key_class(KeyClass::private())
+            // Look in the same (data-protection) keychain the Enclave key was generated into.
+            .ignore_legacy_keychains()
             .label(&self.label(name))
             .load_refs(true)
             .search();
@@ -617,6 +619,7 @@ impl Backend for SecureEnclaveBackend {
 
     fn generate_signing_key(&self, name: &str) -> Result<Option<(String, Vec<u8>)>> {
         use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::item::Location;
         use security_framework::key::{GenerateKeyOptions, KeyType, SecKey, Token};
         // PrivateKeyUsage (1<<30 = kSecAccessControlPrivateKeyUsage), after-first-unlock,
         // device-bound, NO biometric — the key signs unattended once the Mac is unlocked.
@@ -631,6 +634,9 @@ impl Backend for SecureEnclaveBackend {
             .set_size_in_bits(256)
             .set_token(Token::SecureEnclave)
             .set_access_control(access)
+            // The data-protection keychain makes the key PERMANENT (else it is transient and
+            // gone before the next `sign`) and is where Enclave-backed keys must live.
+            .set_location(Location::DataProtectionKeychain)
             .set_label(self.label(name));
         let key = SecKey::new(&options)
             .map_err(|e| Error::Endpoint(format!("enclave key generation: {e}")))?;
