@@ -36,7 +36,10 @@ age = { version = "0.11", default-features = false }
 # The macOS Keychain backend (Security.framework generic passwords). Gated off other
 # platforms, which fall back to the dev file store.
 [target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
+# OSX_10_15 unlocks the DATA-PROTECTION keychain, where Secure-Enclave keys must live to
+# PERSIST and be findable again (a plain file-keychain generate is transient → the key vanishes
+# before the next sign). Both the generate and the lookup select it.
+security-framework = { version = "3", features = ["OSX_10_15"] }
 # Touch ID for `urn:secret:unlock` / `require_biometric` (LocalAuthentication, sync).
 # macOS-gated: off it, the gate is a no-op (a Mac-deployment property).
 robius-authentication = "0.1"
