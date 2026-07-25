@@ -83,6 +83,10 @@ pub struct Signed {
 // Enclave-shaped.
 // =====================================================================================
 
+/// The `sig:algorithm` id a Secure-Enclave signature carries — P-256 / ECDSA-SHA256. Matches
+/// `ikigai-sign`'s id, so `Signed` drops straight into its crypto-agile graph.
+pub const ALG_ES256: &str = "ES256";
+
 /// The fixed SPKI-DER prefix for an uncompressed NIST P-256 public point: `SEQUENCE {
 /// AlgorithmIdentifier { id-ecPublicKey, prime256v1 }, BIT STRING }`. Append the 65-byte X9.63
 /// point (`0x04‖x‖y`) and you have a standard SPKI public key.
@@ -502,6 +506,138 @@ impl Backend for KeychainBackend {
     }
 }
 
+/// The macOS **Secure Enclave** backend — a NON-EXTRACTABLE P-256 signing key per name, born and
+/// kept inside the Enclave. There is no `get`: the private half never leaves the hardware, so
+/// callers `sign` through it instead. The access control is `PrivateKeyUsage` with an
+/// after-first-unlock protection class and NO biometric gate — so the daemon signs unattended,
+/// which is the whole point (it retires the Keychain-prompt / "Allow all applications" dance).
+///
+/// The Enclave is per-device: a key made here can only sign here. The booking daemon's decide
+/// key must therefore be generated on the machine that signs (bug), and only its PUBLIC half
+/// (SPKI) travels — to `decide.pub` on both the Mac and the edge.
+#[cfg(target_os = "macos")]
+pub struct SecureEnclaveBackend {
+    /// Namespaces the Enclave keys' Keychain labels, so several names don't collide.
+    label_prefix: String,
+}
+
+#[cfg(target_os = "macos")]
+impl SecureEnclaveBackend {
+    /// A backend whose keys are labelled `<prefix>.<name>` in the Keychain.
+    pub fn new(label_prefix: &str) -> Self {
+        SecureEnclaveBackend {
+            label_prefix: label_prefix.to_string(),
+        }
+    }
+
+    fn label(&self, name: &str) -> String {
+        format!("{}.{name}", self.label_prefix)
+    }
+
+    /// The signer's public key as SPKI DER, via the Enclave's raw X9.63 point.
+    fn public_spki(key: &security_framework::key::SecKey) -> Result<Vec<u8>> {
+        let public = key
+            .public_key()
+            .ok_or_else(|| Error::Endpoint("enclave key has no public half".into()))?;
+        let point = public
+            .external_representation()
+            .ok_or_else(|| Error::Endpoint("cannot export the enclave public point".into()))?;
+        p256_point_to_spki(point.bytes())
+    }
+
+    /// Find the private SecKey for `name`, or `None` if there is no Enclave key by that label.
+    fn find_private_key(&self, name: &str) -> Result<Option<security_framework::key::SecKey>> {
+        use security_framework::item::{
+            ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult,
+        };
+        let found = ItemSearchOptions::new()
+            .class(ItemClass::key())
+            .key_class(KeyClass::private())
+            .label(&self.label(name))
+            .load_refs(true)
+            .search();
+        let results = match found {
+            Ok(results) => results,
+            // errSecItemNotFound — no such key.
+            Err(e) if e.code() == -25300 => return Ok(None),
+            Err(e) => return Err(Error::Endpoint(format!("enclave key lookup: {e}"))),
+        };
+        for result in results {
+            if let SearchResult::Ref(Reference::Key(key)) = result {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Backend for SecureEnclaveBackend {
+    /// Non-extractable: there are no bytes to hand back. Callers `sign` instead.
+    fn get(&self, _name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// An Enclave key is generated in place, never injected.
+    fn set(&self, _name: &str, _value: &[u8]) -> Result<()> {
+        Err(Error::Endpoint(
+            "a Secure-Enclave key cannot be set from bytes — use generate_signing_key".into(),
+        ))
+    }
+
+    /// Delete the private key by label. (A signing key is normally rotated by regenerating.)
+    fn delete(&self, name: &str) -> Result<()> {
+        match self.find_private_key(name)? {
+            Some(key) => key
+                .delete()
+                .map_err(|e| Error::Endpoint(format!("enclave key delete: {e}"))),
+            None => Ok(()),
+        }
+    }
+
+    fn sign(&self, name: &str, message: &[u8]) -> Result<Option<Signed>> {
+        use security_framework::key::Algorithm;
+        let key = match self.find_private_key(name)? {
+            Some(key) => key,
+            // No Enclave key by this name — let the caller fall back to a software key.
+            None => return Ok(None),
+        };
+        // ECDSASignatureMessageX962SHA256 = ES256: the Enclave hashes with SHA-256 and signs,
+        // emitting an X9.62 DER signature — normalised to fixed r‖s below.
+        let der = key
+            .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
+            .map_err(|e| Error::Endpoint(format!("enclave sign: {e}")))?;
+        let rs = der_ecdsa_to_fixed_rs(&der)?;
+        Ok(Some(Signed {
+            algorithm: ALG_ES256.to_string(),
+            signature: rs.to_vec(),
+            public_key_spki: Self::public_spki(&key)?,
+        }))
+    }
+
+    fn generate_signing_key(&self, name: &str) -> Result<Option<(String, Vec<u8>)>> {
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::key::{GenerateKeyOptions, KeyType, SecKey, Token};
+        // PrivateKeyUsage (1<<30 = kSecAccessControlPrivateKeyUsage), after-first-unlock,
+        // device-bound, NO biometric — the key signs unattended once the Mac is unlocked.
+        let access = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            1 << 30,
+        )
+        .map_err(|e| Error::Endpoint(format!("enclave access control: {e}")))?;
+        let mut options = GenerateKeyOptions::default();
+        options
+            .set_key_type(KeyType::ec())
+            .set_size_in_bits(256)
+            .set_token(Token::SecureEnclave)
+            .set_access_control(access)
+            .set_label(self.label(name));
+        let key = SecKey::new(&options)
+            .map_err(|e| Error::Endpoint(format!("enclave key generation: {e}")))?;
+        Ok(Some((ALG_ES256.to_string(), Self::public_spki(&key)?)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +692,52 @@ mod tests {
         assert!(der_ecdsa_to_fixed_rs(&[]).is_err());
         assert!(der_ecdsa_to_fixed_rs(&[0x30, 0x02, 0x02]).is_err()); // truncated INTEGER
         assert!(der_ecdsa_to_fixed_rs(&[0x30, 0x02, 0x99, 0x01]).is_err()); // not an INTEGER
+    }
+
+    /// The end-to-end Enclave path, on REAL hardware. Ignored by default (CI has no usable
+    /// Enclave); run it on the signing Mac (`bug`) to validate S0:
+    ///
+    ///     cargo test enclave_generate_sign_verify -- --ignored
+    ///
+    /// It generates a throwaway Enclave key, signs, and verifies the r‖s signature against the
+    /// exported SPKI with an INDEPENDENT verifier (p256) — proving generate + sign + both wire
+    /// converters work against the actual Secure Enclave, then deletes the key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs a real Secure Enclave; run on the signing Mac"]
+    fn enclave_generate_sign_verify() {
+        use p256::ecdsa::signature::Verifier;
+        use p256::ecdsa::{Signature, VerifyingKey};
+        use p256::pkcs8::DecodePublicKey;
+
+        let backend = SecureEnclaveBackend::new("ikigai-secret-test");
+        let name = "s0-selftest";
+        let _ = backend.delete(name); // start clean
+
+        let (alg, spki) = backend
+            .generate_signing_key(name)
+            .expect("enclave generate")
+            .expect("enclave backend generates");
+        assert_eq!(alg, ALG_ES256);
+
+        let message = b"the Enclave really signs this";
+        let signed = backend
+            .sign(name, message)
+            .expect("enclave sign")
+            .expect("there is a key to sign with");
+        assert_eq!(signed.algorithm, ALG_ES256);
+        assert_eq!(
+            signed.public_key_spki, spki,
+            "sign reports the generated key"
+        );
+
+        // The whole point: a standard verifier accepts the Enclave's signature via our converters.
+        let key = VerifyingKey::from_public_key_der(&spki).expect("spki parses");
+        let sig = Signature::from_slice(&signed.signature).expect("r‖s parses");
+        key.verify(message, &sig)
+            .expect("the enclave signature verifies");
+
+        backend.delete(name).expect("cleanup");
     }
 
     #[test]
