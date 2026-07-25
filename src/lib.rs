@@ -39,6 +39,117 @@ pub trait Backend: Send + Sync {
     fn set(&self, name: &str, value: &[u8]) -> Result<()>;
     /// Remove the secret; `Ok` even if it was absent.
     fn delete(&self, name: &str) -> Result<()>;
+
+    /// **Sign-through**: sign `message` with the key named `name` WITHOUT extracting the private
+    /// half — for a key that can never leave the store (the Secure Enclave, and later a
+    /// TPM/YubiKey via PKCS#11). This is how `get`→bytes gives way to sign-through: an
+    /// Enclave-resident key has no bytes to `get`, so the store signs on the caller's behalf.
+    ///
+    /// Returns `None` when this backend can't sign-through the named key, so the caller falls
+    /// back to `get`-the-bytes-and-sign-in-process (the software path). The default is
+    /// "not a sign-through signer."
+    fn sign(&self, name: &str, message: &[u8]) -> Result<Option<Signed>> {
+        let _ = (name, message);
+        Ok(None)
+    }
+
+    /// Generate a NON-EXTRACTABLE signing key named `name`, returning `(algorithm-id, SPKI
+    /// public key)`. The private half never leaves the backend — the whole point. `None` if
+    /// this backend cannot hold non-extractable keys (e.g. the file store). Default: unsupported.
+    fn generate_signing_key(&self, name: &str) -> Result<Option<(String, Vec<u8>)>> {
+        let _ = name;
+        Ok(None)
+    }
+}
+
+/// A completed sign-through signature. Everything a verifier or an `ikigai-sign` signature-graph
+/// needs, and nothing the private half would reveal: the algorithm id (as `sig:algorithm`), the
+/// raw signature in that algorithm's wire form (ES256 → 64-byte r‖s), and the SPKI public key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signed {
+    /// The algorithm id, matching `ikigai-sign`'s `sig:algorithm` (e.g. `"ES256"`).
+    pub algorithm: String,
+    /// The signature in the algorithm's wire encoding — for ES256, a 64-byte `r‖s`.
+    pub signature: Vec<u8>,
+    /// The signer's SPKI (DER) public key, for verification and for publishing (`decide.pub`).
+    pub public_key_spki: Vec<u8>,
+}
+
+// =====================================================================================
+// Wire-form conversions for the Enclave (ES256 / P-256). Pure byte-shuffling, and the
+// error-prone part of the Enclave path, so they live here — testable WITHOUT the hardware.
+// The Enclave (SecKeyCreateSignature) speaks DER + X9.63; `ikigai-sign`, `decide.pub` and every
+// standard verifier want fixed r‖s + SPKI. These bridge the two, so nothing downstream is
+// Enclave-shaped.
+// =====================================================================================
+
+/// The fixed SPKI-DER prefix for an uncompressed NIST P-256 public point: `SEQUENCE {
+/// AlgorithmIdentifier { id-ecPublicKey, prime256v1 }, BIT STRING }`. Append the 65-byte X9.63
+/// point (`0x04‖x‖y`) and you have a standard SPKI public key.
+const P256_SPKI_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// Wrap a raw uncompressed P-256 public point (X9.63, `0x04‖x‖y`, 65 bytes — what the Enclave's
+/// `public_key().external_representation()` returns) into standard SPKI DER.
+pub fn p256_point_to_spki(point: &[u8]) -> Result<Vec<u8>> {
+    if point.len() != 65 || point[0] != 0x04 {
+        return Err(Error::Endpoint(format!(
+            "expected a 65-byte uncompressed P-256 point (0x04‖x‖y), got {} bytes",
+            point.len()
+        )));
+    }
+    let mut spki = Vec::with_capacity(P256_SPKI_PREFIX.len() + point.len());
+    spki.extend_from_slice(&P256_SPKI_PREFIX);
+    spki.extend_from_slice(point);
+    Ok(spki)
+}
+
+/// Read one DER `INTEGER` at `*i` in `der` into a 32-byte big-endian P-256 scalar, advancing
+/// `*i`. Strips DER's positive-sign leading zero and left-pads a short scalar.
+fn read_der_scalar(der: &[u8], i: &mut usize) -> Result<[u8; 32]> {
+    let bad = |m: &str| Error::Endpoint(format!("malformed ECDSA DER signature: {m}"));
+    if der.get(*i) != Some(&0x02) {
+        return Err(bad("expected INTEGER"));
+    }
+    *i += 1;
+    let len = *der.get(*i).ok_or_else(|| bad("truncated length"))? as usize;
+    *i += 1;
+    let end = i.checked_add(len).ok_or_else(|| bad("length overflow"))?;
+    let bytes = der.get(*i..end).ok_or_else(|| bad("INTEGER overruns"))?;
+    *i = end;
+    let mut b = bytes;
+    while b.len() > 1 && b[0] == 0 {
+        b = &b[1..];
+    }
+    if b.len() > 32 {
+        return Err(bad("scalar too long for P-256"));
+    }
+    let mut out = [0u8; 32];
+    out[32 - b.len()..].copy_from_slice(b);
+    Ok(out)
+}
+
+/// Convert a DER-encoded ECDSA signature (`SEQUENCE { INTEGER r, INTEGER s }`, as the Enclave /
+/// `SecKeyCreateSignature` emits) into the fixed 64-byte `r‖s` form ES256 uses on the wire and
+/// `ikigai-sign` verifies. P-256, so each scalar is 32 bytes big-endian.
+pub fn der_ecdsa_to_fixed_rs(der: &[u8]) -> Result<[u8; 64]> {
+    let bad = |m: &str| Error::Endpoint(format!("malformed ECDSA DER signature: {m}"));
+    let mut i = 0;
+    if der.first() != Some(&0x30) {
+        return Err(bad("no SEQUENCE"));
+    }
+    i += 1;
+    // Single-byte length: a P-256 signature is always < 128 bytes, so no long-form length.
+    let _seq_len = *der.get(i).ok_or_else(|| bad("truncated"))?;
+    i += 1;
+    let r = read_der_scalar(der, &mut i)?;
+    let s = read_der_scalar(der, &mut i)?;
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(&r);
+    sig[32..].copy_from_slice(&s);
+    Ok(sig)
 }
 
 /// The default backend for this platform: the macOS Keychain, else a dev file store
@@ -396,6 +507,56 @@ mod tests {
     use super::*;
     use ikigai_core::{Capability, Request, Verb};
     use ikigai_resolve::Resolver;
+
+    // ---- the Enclave wire-form converters, validated against p256's canonical encodings ----
+    // (The Enclave itself only runs on real hardware; these are the fiddly bits that don't.)
+
+    #[test]
+    fn a_p256_point_wraps_into_spki_that_parses_back_to_the_same_key() {
+        use p256::ecdsa::{SigningKey, VerifyingKey};
+        use p256::pkcs8::DecodePublicKey;
+
+        let sk = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let vk = sk.verifying_key();
+        let point = vk.to_encoded_point(false); // 0x04‖x‖y, the Enclave's export form
+        let spki = p256_point_to_spki(point.as_bytes()).unwrap();
+        // The wrapped SPKI is a standard public key: p256 parses it back to the same point.
+        assert_eq!(&VerifyingKey::from_public_key_der(&spki).unwrap(), vk);
+    }
+
+    #[test]
+    fn a_der_ecdsa_signature_converts_to_the_canonical_fixed_rs() {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let sig: Signature = sk.sign(b"the Enclave signs this one day");
+        // Convert the DER form (what SecKeyCreateSignature emits) → our fixed r‖s, and it must
+        // match p256's own canonical 64-byte encoding of the same signature.
+        let der = sig.to_der();
+        let fixed = der_ecdsa_to_fixed_rs(der.as_bytes()).unwrap();
+        assert_eq!(&fixed[..], &sig.to_bytes()[..]);
+    }
+
+    #[test]
+    fn short_scalars_are_left_padded_not_misaligned() {
+        // A DER INTEGER shorter than 32 bytes (a small r or s) must land right-aligned in the
+        // 32-byte slot — the classic ECDSA-fixed-encoding bug. SEQUENCE{ INT 0x01, INT 0x02 }.
+        let der = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+        let rs = der_ecdsa_to_fixed_rs(&der).unwrap();
+        assert_eq!(rs[31], 1, "r is right-aligned");
+        assert_eq!(rs[63], 2, "s is right-aligned");
+        assert!(rs[..31].iter().all(|&b| b == 0) && rs[32..63].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn malformed_inputs_error_rather_than_panic() {
+        assert!(p256_point_to_spki(&[0u8; 10]).is_err());
+        assert!(p256_point_to_spki(&[0x03; 65]).is_err()); // compressed point, wrong tag
+        assert!(der_ecdsa_to_fixed_rs(&[]).is_err());
+        assert!(der_ecdsa_to_fixed_rs(&[0x30, 0x02, 0x02]).is_err()); // truncated INTEGER
+        assert!(der_ecdsa_to_fixed_rs(&[0x30, 0x02, 0x99, 0x01]).is_err()); // not an INTEGER
+    }
 
     #[test]
     fn a_secret_round_trips_through_the_file_backend() {
