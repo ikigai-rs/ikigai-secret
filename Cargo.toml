@@ -46,3 +46,6 @@ robius-authentication = "0.1"
 ikigai-resolve = "0.1.9"
 futures = "0.3"
 tempfile = "3"
+# Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
+# canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
