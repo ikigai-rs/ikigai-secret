@@ -17,8 +17,13 @@
 //!   and biometric-gated; the private key never leaves through this op (retrieved separately
 //!   through the cap-gated read face). One identity, two keys: sign *and* encrypt.
 //!
-//! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:unlock`,
-//! `urn:cap:secret:generate`.
+//! A **write face** `urn:secret:{name}` (`Sink`) stores an externally-supplied secret (a Zoom
+//! credential, an API token) from the piped `content` — REPLACING any existing item so the new one
+//! is owned by this process. A keystore item the `security` CLI created re-prompts a code-signed
+//! reader on every access; one this face writes does not, because the ACL is this process's.
+//!
+//! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:write:<name>`,
+//! `urn:cap:secret:unlock`, `urn:cap:secret:generate`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -354,6 +359,31 @@ impl Endpoint for SecretEndpoint {
                     bytes,
                 ))
             }
+            // Store an externally-supplied secret (a Zoom credential, an API token) so it lands
+            // in the keystore OWNED BY THIS PROCESS. The value is the piped `content`.
+            Verb::Sink => {
+                let scope = format!("urn:cap:secret:write:{name}");
+                if !inv.capability.allows(&scope) {
+                    return Err(Error::Denied(format!(
+                        "writing `{name}` requires `{scope}`"
+                    )));
+                }
+                let value = inv
+                    .inline_str("content")
+                    .map_err(|_| Error::MissingArgument("content".into()))?
+                    .to_string();
+                // DELETE then SET, deliberately: a plain update would keep an existing item's
+                // access control (e.g. one the `security` CLI created, which re-prompts a
+                // code-signed reader). Replacing the item re-homes its ACL to whoever writes it
+                // — this process — so the owner's daemon then reads it without a Keychain prompt.
+                self.backend.delete(&name)?;
+                self.backend.set(&name, value.as_bytes())?;
+                // Not cacheable, and the reply carries no secret material.
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"stored".to_vec(),
+                ))
+            }
             other => Err(Error::Endpoint(format!(
                 "urn:secret does not support {other:?} yet"
             ))),
@@ -367,19 +397,27 @@ impl Endpoint for SecretEndpoint {
     fn describe(&self) -> Description {
         Description::new("urn:secret")
             .summary(
-                "Read a secret from the OS keystore (macOS Keychain), capability-gated by \
-                 `urn:cap:secret:read:<name>`. Reserved ops (Source): `urn:secret:unlock` \
-                 (biometric presence, `urn:cap:secret:unlock`) and `urn:secret:generate` \
-                 (mint an Ed25519 keypair — `into=<keyname>` `type=ed25519`; \
-                 `urn:cap:secret:generate` + biometric; stores private PKCS8-PEM under \
-                 `<into>` and public SPKI-PEM under `<into>.pub`, returns the public key). \
+                "Read (Source) or store (Sink) a secret in the OS keystore (macOS Keychain), \
+                 capability-gated by `urn:cap:secret:read:<name>` / `urn:cap:secret:write:<name>`. \
+                 A Sink stores the piped `content`, REPLACING any existing item so the new one is \
+                 owned by this process (a keystore item the `security` CLI created re-prompts a \
+                 code-signed reader; one this writes does not). Reserved ops (Source): \
+                 `urn:secret:unlock` (biometric presence, `urn:cap:secret:unlock`) and \
+                 `urn:secret:generate` (mint an Ed25519 keypair — `into=<keyname>` \
+                 `type=ed25519`; `urn:cap:secret:generate` + biometric; stores private PKCS8-PEM \
+                 under `<into>` and public SPKI-PEM under `<into>.pub`, returns the public key). \
                  Never cached.",
             )
             .verb(Verb::Source)
             .input(
                 ArgSpec::new("name")
-                    .summary("the secret to read (the `{name}` URI slot)")
+                    .summary("the secret to read or store (the `{name}` URI slot)")
                     .binding(),
+            )
+            .input(
+                ArgSpec::new("content")
+                    .summary("Sink: the secret value to store (piped in)")
+                    .optional(),
             )
             .input(
                 ArgSpec::new("into")
@@ -789,6 +827,51 @@ mod tests {
         )
         .expect("granted read resolves");
         assert_eq!(repr.bytes, b"sk-123");
+    }
+
+    #[test]
+    fn the_write_face_stores_replacing_and_is_capability_gated() {
+        use ikigai_core::ArgRef;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FileBackend::new(dir.path()));
+        // A pre-existing value, to prove the write REPLACES it (on macOS this is a fresh,
+        // process-owned Keychain item — here, over the file backend, just the new bytes).
+        backend.set("zoom-client-secret", b"old").unwrap();
+        let kernel = ikigai_core::Kernel::new(Arc::new(space(backend.clone())));
+
+        let req = |val: &str| {
+            Request::new(
+                Verb::Sink,
+                ikigai_core::Iri::parse("urn:secret:zoom-client-secret").unwrap(),
+            )
+            .with_arg("content", ArgRef::Inline(val.as_bytes().to_vec()))
+        };
+        // A read cap (or a cap for another name) can't write — and nothing is stored.
+        assert!(
+            Resolver::issue_as(
+                &kernel,
+                req("new"),
+                &Capability::scoped(["urn:cap:secret:read:zoom-client-secret"])
+            )
+            .is_err(),
+            "a read cap must not write"
+        );
+        assert_eq!(
+            backend.get("zoom-client-secret").unwrap().as_deref(),
+            Some(&b"old"[..]),
+            "a denied write changes nothing"
+        );
+        // With the write scope: stored, replacing the old value.
+        Resolver::issue_as(
+            &kernel,
+            req("csec-xyz"),
+            &Capability::scoped(["urn:cap:secret:write:zoom-client-secret"]),
+        )
+        .expect("granted write resolves");
+        assert_eq!(
+            backend.get("zoom-client-secret").unwrap().as_deref(),
+            Some(&b"csec-xyz"[..])
+        );
     }
 
     #[test]
