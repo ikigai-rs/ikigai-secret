@@ -23,15 +23,21 @@
 //! reader on every access; one this face writes does not, because the ACL is this process's.
 //!
 //! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:write:<name>`,
-//! `urn:cap:secret:unlock`, `urn:cap:secret:generate`.
+//! `urn:cap:secret:unlock`, `urn:cap:secret:generate`. Each is DECLARED on its action
+//! (the per-name pair as the wildcards `urn:cap:secret:read:*` / `urn:cap:secret:write:*`),
+//! so the kernel enforces the floor before an endpoint runs and the manifold offers each
+//! operation only to a holder of its scope. The reserved operations are bound as their own
+//! endpoints ahead of the `{name}` template (see [`space`]). A refused call never reaches
+//! the keystore, so an ungranted caller cannot learn whether a name exists; a secret read
+//! is never cacheable. `tests/conformance.rs` holds all of that to `ikigai-conformance`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Description, Endpoint, EndpointSpace, Error, Invocation, ReprType, Representation,
-    Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, ReprType,
+    Representation, Result, UriTemplate, Verb,
 };
 
 /// A secret store: get / set / delete a named secret's bytes. Implemented by the OS
@@ -175,11 +181,26 @@ pub fn default_backend() -> Arc<dyn Backend> {
 }
 
 /// The `urn:secret:*` space over `backend`. Mount it in a host kernel.
+///
+/// Three entries, in this order: the reserved operations [`UNLOCK_IRI`] and
+/// [`GENERATE_IRI`] bound EXACTLY, then the stored-secret template `urn:secret:{name}`.
+/// A space resolves first match, so the exact bindings shadow the template: a secret can
+/// never be stored under either reserved name, and each operation is offered in the
+/// manifold under its own capability (`urn:cap:secret:unlock`, `urn:cap:secret:generate`)
+/// rather than hidden inside the template's.
 pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
-    EndpointSpace::new().bind(
-        UriTemplate::parse("urn:secret:{name}").expect("valid template"),
-        SecretEndpoint { backend },
-    )
+    EndpointSpace::new()
+        .bind(Exact::new(UNLOCK_IRI), UnlockEndpoint)
+        .bind(
+            Exact::new(GENERATE_IRI),
+            GenerateEndpoint {
+                backend: Arc::clone(&backend),
+            },
+        )
+        .bind(
+            UriTemplate::parse("urn:secret:{name}").expect("valid template"),
+            SecretEndpoint { backend },
+        )
 }
 
 /// [`space`] over [`default_backend`].
@@ -253,8 +274,21 @@ fn generate_age() -> (String, String) {
     (secret, recipient)
 }
 
-/// `urn:secret:{name}` — read a secret, capability-gated. Write/delete over the wire are
-/// a later slice; a host writes through the [`Backend`] directly for now.
+/// The XSD `string` datatype IRI — every input of this module is a scalar name or value.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// `urn:secret:unlock` — the biometric-presence operation, bound EXACTLY ahead of the
+/// `{name}` template (see [`space`]).
+pub const UNLOCK_IRI: &str = "urn:secret:unlock";
+
+/// `urn:secret:generate` — the key-minting operation, bound EXACTLY ahead of the
+/// `{name}` template (see [`space`]).
+pub const GENERATE_IRI: &str = "urn:secret:generate";
+
+/// The stored-secret endpoint: `urn:secret:{name}`, `Source` under
+/// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`. The
+/// capability is checked BEFORE the keystore is consulted, so an ungranted caller learns
+/// nothing — not even whether the name exists — and the backend is never touched.
 struct SecretEndpoint {
     backend: Arc<dyn Backend>,
 }
@@ -267,82 +301,10 @@ impl Endpoint for SecretEndpoint {
             .get("name")
             .map(|s| s.to_string())
             .ok_or_else(|| Error::MissingArgument("name".into()))?;
-        // `urn:secret:unlock` is a reserved operation, not a stored secret: prove
-        // biometric presence (Touch ID), capability-gated by `urn:cap:secret:unlock`.
-        if name == "unlock" {
-            if inv.request.verb != Verb::Source {
-                return Err(Error::Endpoint("urn:secret:unlock is a Source".into()));
-            }
-            if !inv.capability.allows("urn:cap:secret:unlock") {
-                return Err(Error::Denied(
-                    "unlock requires `urn:cap:secret:unlock`".into(),
-                ));
-            }
-            require_biometric("Unlock ikigai secrets")?;
-            return Ok(Representation::new(
-                ReprType::new("text/plain"),
-                b"unlocked".to_vec(),
-            ));
-        }
-        // `urn:secret:generate` is a reserved operation, not a stored secret: mint a
-        // keypair. The URI slot `{name}` is already bound to the literal `generate`, so the
-        // key name arrives as a DISTINCT by-value argument `into=<keyname>` — NOT `name`,
-        // which the template has taken. `type=ed25519` (signing, default) or `age`
-        // (encryption). Cap-gate FIRST (default-deny), then prove biometric, then store.
-        if name == "generate" {
-            if inv.request.verb != Verb::Source {
-                return Err(Error::Endpoint("urn:secret:generate is a Source".into()));
-            }
-            if !inv.capability.allows("urn:cap:secret:generate") {
-                return Err(Error::Denied(
-                    "generate requires `urn:cap:secret:generate`".into(),
-                ));
-            }
-            let key = inv.inline_str("into")?.to_string();
-            let kind = if inv.request.args.contains_key("type") {
-                inv.inline_str("type")?
-            } else {
-                "ed25519"
-            };
-            // Private key → `<name>`; public key → `<name>.pub`; the endpoint returns the
-            // PUBLIC half (private is retrieved separately through the cap-gated read face).
-            // Not cacheable (mutating + fresh randomness): the default, nothing to opt into.
-            match kind {
-                // `ed25519` — the SIGNING keypair (PKCS8/SPKI PEM), read by ikigai-sign.
-                "ed25519" => {
-                    require_biometric(&format!("Generate signing key {key}"))?;
-                    let (pkcs8_pem, spki_pem) = generate_ed25519()?;
-                    self.backend.set(&key, pkcs8_pem.as_bytes())?;
-                    self.backend
-                        .set(&format!("{key}.pub"), spki_pem.as_bytes())?;
-                    return Ok(Representation::new(
-                        ReprType::new("application/x-pem-file"),
-                        spki_pem.into_bytes(),
-                    ));
-                }
-                // `age` — the ENCRYPTION keypair (X25519 identity/recipient), read by
-                // ikigai-encrypt. The dual of the signing key: one identity, two keys.
-                "age" => {
-                    require_biometric(&format!("Generate encryption key {key}"))?;
-                    let (identity, recipient) = generate_age();
-                    self.backend.set(&key, identity.as_bytes())?;
-                    self.backend
-                        .set(&format!("{key}.pub"), recipient.as_bytes())?;
-                    return Ok(Representation::new(
-                        ReprType::new("text/plain"),
-                        recipient.into_bytes(),
-                    ));
-                }
-                other => {
-                    return Err(Error::InvalidArgument {
-                        name: "type".into(),
-                        detail: format!("unsupported key type `{other}` (use ed25519 or age)"),
-                    });
-                }
-            }
-        }
         match inv.request.verb {
             Verb::Source => {
+                // The kernel already enforced the declared `urn:cap:secret:read:*` floor
+                // (some grant under the prefix); this is the exact-name rule behind it.
                 let scope = format!("urn:cap:secret:read:{name}");
                 if !inv.capability.allows(&scope) {
                     return Err(Error::Denied(format!(
@@ -352,8 +314,9 @@ impl Endpoint for SecretEndpoint {
                 let bytes = self
                     .backend
                     .get(&name)?
-                    .ok_or_else(|| Error::Endpoint(format!("no secret `{name}`")))?;
-                // Never cacheable — a secret must not linger in a shared cache.
+                    .ok_or_else(|| Error::NotFound(format!("no secret `{name}`")))?;
+                // Never cacheable — a secret must not linger in a shared cache. The
+                // default expiry is `Always`; nothing here opts into caching.
                 Ok(Representation::new(
                     ReprType::new("application/octet-stream"),
                     bytes,
@@ -368,10 +331,7 @@ impl Endpoint for SecretEndpoint {
                         "writing `{name}` requires `{scope}`"
                     )));
                 }
-                let value = inv
-                    .inline_str("content")
-                    .map_err(|_| Error::MissingArgument("content".into()))?
-                    .to_string();
+                let value = inv.inline_str("content")?.to_string();
                 // DELETE then SET, deliberately: a plain update would keep an existing item's
                 // access control (e.g. one the `security` CLI created, which re-prompts a
                 // code-signed reader). Replacing the item re-homes its ACL to whoever writes it
@@ -395,43 +355,184 @@ impl Endpoint for SecretEndpoint {
     }
 
     fn describe(&self) -> Description {
+        // The id `urn:secret` predates the kebab-case convention and is a live MCP tool
+        // name; it is renamed in the coordinated wave-two pass, not here.
+        let name = || {
+            ArgSpec::new("name")
+                .summary("the secret's name (the `{name}` URI slot)")
+                .class(XSD_STRING)
+                .binding()
+        };
         Description::new("urn:secret")
             .summary(
-                "Read (Source) or store (Sink) a secret in the OS keystore (macOS Keychain), \
-                 capability-gated by `urn:cap:secret:read:<name>` / `urn:cap:secret:write:<name>`. \
-                 A Sink stores the piped `content`, REPLACING any existing item so the new one is \
-                 owned by this process (a keystore item the `security` CLI created re-prompts a \
-                 code-signed reader; one this writes does not). Reserved ops (Source): \
-                 `urn:secret:unlock` (biometric presence, `urn:cap:secret:unlock`) and \
-                 `urn:secret:generate` (mint an Ed25519 keypair — `into=<keyname>` \
-                 `type=ed25519`; `urn:cap:secret:generate` + biometric; stores private PKCS8-PEM \
-                 under `<into>` and public SPKI-PEM under `<into>.pub`, returns the public key). \
-                 Never cached.",
+                "Read (Source) or store (Sink) a named secret in the OS keystore (macOS Keychain; \
+                 a file store elsewhere), capability-gated PER NAME: `urn:cap:secret:read:<name>` \
+                 / `urn:cap:secret:write:<name>`, default-deny, refused before the keystore is \
+                 consulted. A Sink stores the piped `content`, REPLACING any existing item so the \
+                 new one is owned by this process (a keystore item the `security` CLI created \
+                 re-prompts a code-signed reader; one this writes does not). Never cached: every \
+                 read hits the keystore. The reserved operations `urn:secret:unlock` and \
+                 `urn:secret:generate` are bound ahead of this template as their own endpoints.",
+            )
+            .input(name())
+            .output("application/octet-stream")
+            .output("text/plain")
+            // Per-verb contracts: the capability is parameterized by name, so each action
+            // declares the wildcard form — "holds SOME grant under this prefix" — and the
+            // exact name is checked at invoke time.
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("read a secret's bytes")
+                    .requires("urn:cap:secret:read:*")
+                    .input(name())
+                    .output("application/octet-stream"),
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("store a secret, replacing any existing item")
+                    .requires("urn:cap:secret:write:*")
+                    .input(name())
+                    .input(
+                        ArgSpec::new("content")
+                            .summary("the secret value to store (piped in)")
+                            .class(XSD_STRING),
+                    )
+                    .output("text/plain"),
+            )
+    }
+}
+
+/// `urn:secret:unlock` — prove biometric presence (Touch ID), capability-gated by
+/// `urn:cap:secret:unlock`. A reserved operation, not a stored secret.
+struct UnlockEndpoint;
+
+#[async_trait]
+impl Endpoint for UnlockEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint("urn:secret:unlock is a Source".into()));
+        }
+        if !inv.capability.allows("urn:cap:secret:unlock") {
+            return Err(Error::Denied(
+                "unlock requires `urn:cap:secret:unlock`".into(),
+            ));
+        }
+        require_biometric("Unlock ikigai secrets")?;
+        Ok(Representation::new(
+            ReprType::new("text/plain"),
+            b"unlocked".to_vec(),
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "secret-unlock"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("secret-unlock")
+            .summary(
+                "Prove biometric presence (macOS Touch ID; a no-op elsewhere) for an operation \
+                 that needs a person at the machine. Capability-gated by `urn:cap:secret:unlock`, \
+                 checked BEFORE any prompt. Never cached.",
             )
             .verb(Verb::Source)
-            .input(
-                ArgSpec::new("name")
-                    .summary("the secret to read or store (the `{name}` URI slot)")
-                    .binding(),
+            .requires("urn:cap:secret:unlock")
+            .output("text/plain")
+    }
+}
+
+/// `urn:secret:generate` — mint a keypair into the keystore, capability-gated by
+/// `urn:cap:secret:generate` and then biometric-gated. A reserved operation, not a stored
+/// secret: the key name arrives as the by-value argument `into=<keyname>`.
+struct GenerateEndpoint {
+    backend: Arc<dyn Backend>,
+}
+
+#[async_trait]
+impl Endpoint for GenerateEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if inv.request.verb != Verb::Source {
+            return Err(Error::Endpoint("urn:secret:generate is a Source".into()));
+        }
+        // Cap-gate FIRST (default-deny), then prove biometric, then store.
+        if !inv.capability.allows("urn:cap:secret:generate") {
+            return Err(Error::Denied(
+                "generate requires `urn:cap:secret:generate`".into(),
+            ));
+        }
+        let key = inv.inline_str("into")?.to_string();
+        let kind = if inv.request.args.contains_key("type") {
+            inv.inline_str("type")?
+        } else {
+            "ed25519"
+        };
+        // Private key → `<name>`; public key → `<name>.pub`; the endpoint returns the
+        // PUBLIC half (private is retrieved separately through the cap-gated read face).
+        // Not cacheable (mutating + fresh randomness): the default, nothing to opt into.
+        match kind {
+            // `ed25519` — the SIGNING keypair (PKCS8/SPKI PEM), read by ikigai-sign.
+            "ed25519" => {
+                require_biometric(&format!("Generate signing key {key}"))?;
+                let (pkcs8_pem, spki_pem) = generate_ed25519()?;
+                self.backend.set(&key, pkcs8_pem.as_bytes())?;
+                self.backend
+                    .set(&format!("{key}.pub"), spki_pem.as_bytes())?;
+                Ok(Representation::new(
+                    ReprType::new("application/x-pem-file"),
+                    spki_pem.into_bytes(),
+                ))
+            }
+            // `age` — the ENCRYPTION keypair (X25519 identity/recipient), read by
+            // ikigai-encrypt. The dual of the signing key: one identity, two keys.
+            "age" => {
+                require_biometric(&format!("Generate encryption key {key}"))?;
+                let (identity, recipient) = generate_age();
+                self.backend.set(&key, identity.as_bytes())?;
+                self.backend
+                    .set(&format!("{key}.pub"), recipient.as_bytes())?;
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    recipient.into_bytes(),
+                ))
+            }
+            other => Err(Error::InvalidArgument {
+                name: "type".into(),
+                detail: format!("unsupported key type `{other}` (use ed25519 or age)"),
+            }),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "secret-generate"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("secret-generate")
+            .summary(
+                "Mint a keypair into the keystore: an Ed25519 signing key (`type=ed25519`, the \
+                 default; PKCS8-PEM private, SPKI-PEM public, read by ikigai-sign) or an `age` \
+                 X25519 encryption key (`type=age`; identity/recipient, read by ikigai-encrypt). \
+                 The private half is stored under `<into>`, the public half under `<into>.pub`, \
+                 and only the public half is returned. Capability-gated by \
+                 `urn:cap:secret:generate`, then biometric-gated (macOS Touch ID). Never cached.",
             )
-            .input(
-                ArgSpec::new("content")
-                    .summary("Sink: the secret value to store (piped in)")
-                    .optional(),
-            )
+            .verb(Verb::Source)
+            .requires("urn:cap:secret:generate")
             .input(
                 ArgSpec::new("into")
-                    .summary("`generate`: the key name to mint into (private at `<into>`, public at `<into>.pub`)")
-                    .optional(),
+                    .summary(
+                        "the key name to mint into (private at `<into>`, public at `<into>.pub`)",
+                    )
+                    .class(XSD_STRING),
             )
             .input(
                 ArgSpec::new("type")
-                    .summary("`generate` key type: `ed25519` (signing, default) or `age` (encryption)")
+                    .summary("`ed25519` (signing, default) or `age` (encryption)")
+                    .class(XSD_STRING)
                     .one_of(["ed25519", "age"])
                     .default_value("ed25519")
                     .optional(),
             )
-            .output("application/octet-stream")
             .output("application/x-pem-file")
             .output("text/plain")
     }
@@ -885,10 +986,9 @@ mod tests {
             Verb::Source,
             ikigai_core::Iri::parse("urn:secret:unlock").unwrap(),
         );
-        assert!(
-            Resolver::issue_as(&kernel, req, &Capability::scoped(Vec::<String>::new())).is_err(),
-            "unlock without `urn:cap:secret:unlock` is denied"
-        );
+        let err = Resolver::issue_as(&kernel, req, &Capability::scoped(Vec::<String>::new()))
+            .expect_err("unlock without `urn:cap:secret:unlock` is denied");
+        assert!(matches!(err, Error::Denied(_)), "typed: {err:?}");
     }
 
     fn generate_req(key: &str) -> Request {
@@ -960,15 +1060,13 @@ mod tests {
 
         // No cap → denied. The cap check runs before keygen/biometric, so this is denied
         // WITHOUT any Touch ID prompt (holds on macOS too).
-        assert!(
-            Resolver::issue_as(
-                &kernel,
-                generate_req("nope"),
-                &Capability::scoped(Vec::<String>::new()),
-            )
-            .is_err(),
-            "generate without `urn:cap:secret:generate` is denied"
-        );
+        let err = Resolver::issue_as(
+            &kernel,
+            generate_req("nope"),
+            &Capability::scoped(Vec::<String>::new()),
+        )
+        .expect_err("generate without `urn:cap:secret:generate` is denied");
+        assert!(matches!(err, Error::Denied(_)), "typed: {err:?}");
         // Nothing was stored — neither the private key nor its `.pub`.
         assert!(
             backend.get("nope").unwrap().is_none(),
