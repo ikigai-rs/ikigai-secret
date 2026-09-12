@@ -52,7 +52,7 @@ tempfile = "3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
 # reports every violation at once. Its own floor on ikigai-core (0.1.67) is above the
 # library's; the library's pin stays the true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
 # Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
 # canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
