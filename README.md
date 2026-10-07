@@ -121,7 +121,7 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   that folds case. A secret stored under a name outside the verbatim set must be stored
   again.
 
-## Unreleased
+## 0.1.7 (2026-10-07)
 
 Fixes for audit round 3 (ledger #854, and #203). **Version call: a patch, 0.1.7.** The Rust
 API is source-compatible (two trait methods with defaults, one deprecation), and every change
