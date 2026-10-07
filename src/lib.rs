@@ -358,12 +358,14 @@ impl Endpoint for SecretEndpoint {
                         "writing `{name}` requires `{scope}`"
                     )));
                 }
-                let value = inv.inline_str("content")?.to_string();
+                // Any bytes: the read face serves `application/octet-stream`, so the write face
+                // takes exactly what it may hand back (a binary key, not only text).
+                let value = inv.inline_arg("content")?;
                 // `replace`, never a delete here followed by a set: how a store replaces is
                 // the store's to say. The file store renames a fully written file over the old
                 // one, so a failed write keeps the previous secret; the Keychain deletes and
                 // re-adds to re-home the item's access control (see `KeychainBackend`).
-                self.backend.replace(&name, value.as_bytes())?;
+                self.backend.replace(&name, value)?;
                 // Not cacheable, and the reply carries no secret material.
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
@@ -420,7 +422,7 @@ impl Endpoint for SecretEndpoint {
                     .input(name())
                     .input(
                         ArgSpec::new("content")
-                            .summary("the secret value to store (piped in)")
+                            .summary("the secret value to store, any bytes (piped in)")
                             .class(XSD_STRING),
                     )
                     .output("text/plain"),

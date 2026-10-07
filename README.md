@@ -144,6 +144,9 @@ only verbatim-set names. What changes for a caller:
 - **`Backend::replace` and `Backend::exists`**, with defaults (delete-then-set; get). The
   Sink calls `replace`. The Secure Enclave's refuses before deleting (a Sink over it used to
   delete the key and then fail to store anything).
+- **The write face takes any bytes** (the second audit's S3): `content` is no longer required
+  to be UTF-8, so a binary secret the read face serves as `application/octet-stream` can be
+  replaced through the resource.
 - `ikigai-core` floor `0.1.46` → `0.1.58` (`config::data_home_from`).
 
 ## Next slices
