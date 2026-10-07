@@ -613,3 +613,31 @@ fn b4_generate_never_stores_under_a_reserved_name() {
         assert!(backend.get(&format!("{reserved}.pub")).unwrap().is_none());
     }
 }
+
+// =============================================================================================
+// S3 (the second audit): the write face takes any bytes, as the read face serves them
+// =============================================================================================
+
+/// The read face answers `application/octet-stream`, so the write face must take the same
+/// bytes: a binary secret set through the backend can be replaced through the resource.
+#[test]
+fn s3_the_write_face_stores_any_bytes() {
+    let (dir, _guard) = store("s3");
+    let backend = Arc::new(FileBackend::new(&dir));
+    backend.set("blob", &[0x00, 0xff, 0x01]).unwrap();
+    let kernel = kernel_over(backend.clone());
+    let binary = [0xff, 0x00, 0x80, 0xfe, b'\n'];
+    Resolver::issue_as(
+        &kernel,
+        sink("blob", &binary),
+        &scoped(&["urn:cap:secret:write:blob"]),
+    )
+    .expect("a non-UTF-8 value is stored");
+    let (repr, _) = Resolver::issue_as(
+        &kernel,
+        source("blob"),
+        &scoped(&["urn:cap:secret:read:blob"]),
+    )
+    .unwrap();
+    assert_eq!(repr.bytes, binary, "and read back byte for byte");
+}
