@@ -11,8 +11,9 @@ keywords = ["ikigai", "roc", "secret", "keychain", "capability"]
 categories = ["os"]
 
 [dependencies]
-# The kernel: Endpoint/Space/Capability/Error. Same version the hosts link.
-ikigai-core = "0.1.46"
+# The kernel: Endpoint/Space/Capability/Error, and `config::data_home_from` (0.1.58; 0.1.57 was
+# never published) for the file store's default directory.
+ikigai-core = "0.1.58"
 # Endpoint::invoke is async (dyn via async-trait).
 async-trait = "0.1"
 
@@ -43,6 +44,10 @@ security-framework = { version = "3", features = ["OSX_10_15"] }
 # Touch ID for `urn:secret:unlock` / `require_biometric` (LocalAuthentication, sync).
 # macOS-gated: off it, the gate is a no-op (a Mac-deployment property).
 robius-authentication = "0.1"
+
+# The file store's owner check: the effective uid its directory and files must belong to.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Resolver::issue_as drives the capability-gating test.

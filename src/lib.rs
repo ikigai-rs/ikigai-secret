@@ -13,25 +13,29 @@
 //!   `type=ed25519`|`age`) mints a keypair — an **Ed25519** signing key (PKCS8/SPKI PEM,
 //!   read by `ikigai-sign`) or an **`age`** X25519 encryption key (identity/recipient, read
 //!   by `ikigai-encrypt`) — storing the private half under `<name>` and the public half
-//!   under `<name>.pub`, and returning the public half. Cap-gated (`urn:cap:secret:generate`)
-//!   and biometric-gated; the private key never leaves through this op (retrieved separately
-//!   through the cap-gated read face). One identity, two keys: sign *and* encrypt.
+//!   under `<name>.pub`, and returning the public half. Cap-gated (`urn:cap:secret:generate`
+//!   AND the write scope of both names it writes) and biometric-gated; it never replaces a
+//!   stored secret nor mints into a reserved name, and never leaves half a pair. The private
+//!   key never leaves through this op (retrieved separately through the cap-gated read face).
+//!   One identity, two keys: sign *and* encrypt.
 //!
 //! A **write face** `urn:secret:{name}` (`Sink`) stores an externally-supplied secret (a Zoom
-//! credential, an API token) from the piped `content` — REPLACING any existing item so the new one
-//! is owned by this process. A keystore item the `security` CLI created re-prompts a code-signed
-//! reader on every access; one this face writes does not, because the ACL is this process's.
+//! credential, an API token) from the piped `content` — REPLACING any existing item through
+//! [`Backend::replace`]. On the Keychain the new item is owned by this process: a keystore item
+//! the `security` CLI created re-prompts a code-signed reader on every access; one this face
+//! writes does not, because the ACL is this process's. On the file store the replace is atomic.
 //!
 //! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:write:<name>`,
-//! `urn:cap:secret:unlock`, `urn:cap:secret:generate`. Each is DECLARED on its action
-//! (the per-name pair as the wildcards `urn:cap:secret:read:*` / `urn:cap:secret:write:*`),
+//! `urn:cap:secret:unlock`, `urn:cap:secret:generate` (with the write scopes of what it
+//! writes). Each is DECLARED on its action (the per-name pair as the wildcards
+//! `urn:cap:secret:read:*` / `urn:cap:secret:write:*`),
 //! so the kernel enforces the floor before an endpoint runs and the manifold offers each
 //! operation only to a holder of its scope. The reserved operations are bound as their own
 //! endpoints ahead of the `{name}` template (see [`space`]). A refused call never reaches
 //! the keystore, so an ungranted caller cannot learn whether a name exists; a secret read
 //! is never cacheable. `tests/conformance.rs` holds all of that to `ikigai-conformance`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -50,6 +54,26 @@ pub trait Backend: Send + Sync {
     fn set(&self, name: &str, value: &[u8]) -> Result<()>;
     /// Remove the secret; `Ok` even if it was absent.
     fn delete(&self, name: &str) -> Result<()>;
+
+    /// Whether a secret named `name` is stored. The default reads it through [`get`]; a
+    /// backend that can answer without reading the bytes overrides it.
+    ///
+    /// [`get`]: Backend::get
+    fn exists(&self, name: &str) -> Result<bool> {
+        Ok(self.get(name)?.is_some())
+    }
+
+    /// Replace the secret's bytes: what the write face's `Sink` calls.
+    ///
+    /// The default DELETES, then SETS, which is what the Keychain needs (see the macOS-only
+    /// `KeychainBackend`'s note) and is **not atomic**: a `set` that fails after the
+    /// `delete` loses the previous secret. A backend that can replace atomically overrides it
+    /// — [`FileBackend`] writes a temporary file and renames it over the old one — and a
+    /// backend that cannot be `set` at all refuses before deleting anything.
+    fn replace(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.delete(name)?;
+        self.set(name, value)
+    }
 
     /// **Sign-through**: sign `message` with the key named `name` WITHOUT extracting the private
     /// half — for a key that can never leave the store (the Secure Enclave, and later a
@@ -176,7 +200,7 @@ pub fn default_backend() -> Arc<dyn Backend> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Arc::new(FileBackend::in_config_dir())
+        Arc::new(FileBackend::in_data_dir_or_refusing())
     }
 }
 
@@ -285,6 +309,9 @@ pub const UNLOCK_IRI: &str = "urn:secret:unlock";
 /// `{name}` template (see [`space`]).
 pub const GENERATE_IRI: &str = "urn:secret:generate";
 
+/// The names the reserved operations take from the `{name}` template: never a secret's name.
+const RESERVED: [&str; 2] = ["unlock", "generate"];
+
 /// The stored-secret endpoint: `urn:secret:{name}`, `Source` under
 /// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`. The
 /// capability is checked BEFORE the keystore is consulted, so an ungranted caller learns
@@ -332,12 +359,11 @@ impl Endpoint for SecretEndpoint {
                     )));
                 }
                 let value = inv.inline_str("content")?.to_string();
-                // DELETE then SET, deliberately: a plain update would keep an existing item's
-                // access control (e.g. one the `security` CLI created, which re-prompts a
-                // code-signed reader). Replacing the item re-homes its ACL to whoever writes it
-                // — this process — so the owner's daemon then reads it without a Keychain prompt.
-                self.backend.delete(&name)?;
-                self.backend.set(&name, value.as_bytes())?;
+                // `replace`, never a delete here followed by a set: how a store replaces is
+                // the store's to say. The file store renames a fully written file over the old
+                // one, so a failed write keeps the previous secret; the Keychain deletes and
+                // re-adds to re-home the item's access control (see `KeychainBackend`).
+                self.backend.replace(&name, value.as_bytes())?;
                 // Not cacheable, and the reply carries no secret material.
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
@@ -448,6 +474,35 @@ struct GenerateEndpoint {
     backend: Arc<dyn Backend>,
 }
 
+impl GenerateEndpoint {
+    /// Store a freshly minted pair under two names that held nothing, so that a failure can
+    /// never leave half of it: if the public half cannot be written, the private half is
+    /// removed again (it was new, so removing it loses nothing).
+    fn store_pair(
+        &self,
+        key: &str,
+        public: &str,
+        private: &[u8],
+        public_half: &[u8],
+    ) -> Result<()> {
+        self.backend.set(key, private)?;
+        if let Err(e) = self.backend.set(public, public_half) {
+            return Err(match self.backend.delete(key) {
+                Ok(()) => Error::Endpoint(format!(
+                    "generate stored nothing: writing `{public}` failed ({e}), so the private \
+                     half `{key}` was removed again"
+                )),
+                Err(undo) => Error::Endpoint(format!(
+                    "generate failed writing `{public}` ({e}) and could not remove the private \
+                     half `{key}` ({undo}): `{key}` holds a private key with no public half; \
+                     delete it at the box"
+                )),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Endpoint for GenerateEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
@@ -461,45 +516,74 @@ impl Endpoint for GenerateEndpoint {
             ));
         }
         let key = inv.inline_str("into")?.to_string();
+        let public = format!("{key}.pub");
         let kind = if inv.request.args.contains_key("type") {
             inv.inline_str("type")?
         } else {
             "ed25519"
         };
+        if !matches!(kind, "ed25519" | "age") {
+            return Err(Error::InvalidArgument {
+                name: "type".into(),
+                detail: format!("unsupported key type `{kind}` (use ed25519 or age)"),
+            });
+        }
+        // A reserved operation's name is never a secret's: the exact binding shadows the
+        // template, so a key stored there could never be read back.
+        if RESERVED.contains(&key.as_str()) {
+            return Err(Error::InvalidArgument {
+                name: "into".into(),
+                detail: format!(
+                    "`{key}` names the reserved operation `urn:secret:{key}`, never a secret"
+                ),
+            });
+        }
+        // Generate WRITES two secrets, so it needs the write authority over both that a Sink
+        // of each would. The kernel enforced the declared `urn:cap:secret:write:*` floor;
+        // these are the exact names behind it.
+        for name in [&key, &public] {
+            let scope = format!("urn:cap:secret:write:{name}");
+            if !inv.capability.allows(&scope) {
+                return Err(Error::Denied(format!(
+                    "generate into `{key}` writes `{key}` and `{public}`, so it requires \
+                     `urn:cap:secret:write:{key}` and `urn:cap:secret:write:{public}`; \
+                     missing `{scope}`"
+                )));
+            }
+        }
+        // And it never replaces: a name already holding either half is refused, before the
+        // biometric prompt. Rotating a key is minting a new name.
+        for name in [&key, &public] {
+            if self.backend.exists(name)? {
+                return Err(Error::InvalidArgument {
+                    name: "into".into(),
+                    detail: format!(
+                        "`{name}` already holds a secret, and generate never replaces one; \
+                         mint into a new name"
+                    ),
+                });
+            }
+        }
         // Private key → `<name>`; public key → `<name>.pub`; the endpoint returns the
         // PUBLIC half (private is retrieved separately through the cap-gated read face).
         // Not cacheable (mutating + fresh randomness): the default, nothing to opt into.
-        match kind {
+        let (private, public_half, media_type) = if kind == "ed25519" {
             // `ed25519` — the SIGNING keypair (PKCS8/SPKI PEM), read by ikigai-sign.
-            "ed25519" => {
-                require_biometric(&format!("Generate signing key {key}"))?;
-                let (pkcs8_pem, spki_pem) = generate_ed25519()?;
-                self.backend.set(&key, pkcs8_pem.as_bytes())?;
-                self.backend
-                    .set(&format!("{key}.pub"), spki_pem.as_bytes())?;
-                Ok(Representation::new(
-                    ReprType::new("application/x-pem-file"),
-                    spki_pem.into_bytes(),
-                ))
-            }
+            require_biometric(&format!("Generate signing key {key}"))?;
+            let (pkcs8_pem, spki_pem) = generate_ed25519()?;
+            (pkcs8_pem, spki_pem, "application/x-pem-file")
+        } else {
             // `age` — the ENCRYPTION keypair (X25519 identity/recipient), read by
             // ikigai-encrypt. The dual of the signing key: one identity, two keys.
-            "age" => {
-                require_biometric(&format!("Generate encryption key {key}"))?;
-                let (identity, recipient) = generate_age();
-                self.backend.set(&key, identity.as_bytes())?;
-                self.backend
-                    .set(&format!("{key}.pub"), recipient.as_bytes())?;
-                Ok(Representation::new(
-                    ReprType::new("text/plain"),
-                    recipient.into_bytes(),
-                ))
-            }
-            other => Err(Error::InvalidArgument {
-                name: "type".into(),
-                detail: format!("unsupported key type `{other}` (use ed25519 or age)"),
-            }),
-        }
+            require_biometric(&format!("Generate encryption key {key}"))?;
+            let (identity, recipient) = generate_age();
+            (identity, recipient, "text/plain")
+        };
+        self.store_pair(&key, &public, private.as_bytes(), public_half.as_bytes())?;
+        Ok(Representation::new(
+            ReprType::new(media_type),
+            public_half.into_bytes(),
+        ))
     }
 
     fn name(&self) -> &str {
@@ -513,15 +597,22 @@ impl Endpoint for GenerateEndpoint {
                  default; PKCS8-PEM private, SPKI-PEM public, read by ikigai-sign) or an `age` \
                  X25519 encryption key (`type=age`; identity/recipient, read by ikigai-encrypt). \
                  The private half is stored under `<into>`, the public half under `<into>.pub`, \
-                 and only the public half is returned. Capability-gated by \
-                 `urn:cap:secret:generate`, then biometric-gated (macOS Touch ID). Never cached.",
+                 and only the public half is returned. Requires `urn:cap:secret:generate` AND \
+                 the write scope for both names it writes (`urn:cap:secret:write:<into>` and \
+                 `urn:cap:secret:write:<into>.pub`); never replaces a stored secret (a name \
+                 holding either half is refused) and never mints into a reserved name. Then \
+                 biometric-gated (macOS Touch ID). Never cached.",
             )
             .verb(Verb::Source)
             .requires("urn:cap:secret:generate")
+            // Parameterized by name, so declared as the wildcard floor; the exact
+            // `<into>` and `<into>.pub` scopes are checked at invoke time.
+            .requires("urn:cap:secret:write:*")
             .input(
                 ArgSpec::new("into")
                     .summary(
-                        "the key name to mint into (private at `<into>`, public at `<into>.pub`)",
+                        "the NEW key name to mint into (private at `<into>`, public at \
+                         `<into>.pub`); neither may hold a secret already",
                     )
                     .class(XSD_STRING),
             )
@@ -538,65 +629,456 @@ impl Endpoint for GenerateEndpoint {
     }
 }
 
-/// A dev file backend: one file per secret under a directory (default `~/.ikigai/secrets`,
-/// override with `IKIGAI_SECRETS`). Not hardware-backed — for non-macOS / development.
+/// A dev file backend: one file per secret in a PRIVATE directory (default
+/// `~/.ikigai/secrets`, override with `IKIGAI_SECRETS`). Not hardware-backed — for non-macOS
+/// and development.
+///
+/// **The storage format.** A secret's bytes are the whole content of one regular file whose
+/// name is the secret's name, escaped so that the mapping is injective and case-safe:
+///
+/// - `a`–`z`, `0`–`9`, `-`, `_` and `.` are kept verbatim — except a LEADING `.`, so no name
+///   can address `.`, `..` or a hidden file (the store's own temporary files are hidden);
+/// - every other byte of the name's UTF-8, uppercase ASCII included, is written as `%` and
+///   two lowercase hex digits (`API-KEY` → `%41%50%49-%4b%45%59`, `team:db` → `team%3adb`).
+///
+/// No file name the mapping produces contains an uppercase letter, so two distinct names are
+/// two distinct files even on a volume that folds case. A name made only of the verbatim set
+/// keeps the file name every earlier version gave it, so an existing store of such names
+/// reads unchanged. An earlier version mapped every other character to `_`, collapsing
+/// distinct names onto one file; which name wrote such a file cannot be known, so it is
+/// served only under the name its file name spells (as before), never under the name that may
+/// have written it.
+///
+/// **Modes (Unix).** The directory is `0700` and every file `0600`, set explicitly at
+/// creation so the umask cannot widen them. An existing directory or file others can READ is
+/// tightened to `0700`/`0600` and logged once on stderr; one others can WRITE, or owned by
+/// another user, is refused: its contents are not trusted, and tightening it would trust
+/// whatever was written. **Writes are atomic**: a `set` writes a `0600` temporary file in the
+/// store, syncs it and renames it over the old one, so a failed write leaves the previous
+/// secret intact.
 pub struct FileBackend {
-    dir: PathBuf,
+    /// The store directory, or why there is none: every operation then refuses with it.
+    dir: std::result::Result<PathBuf, String>,
 }
 
 impl FileBackend {
     /// A backend rooted at `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        FileBackend { dir: dir.into() }
+        FileBackend {
+            dir: Ok(dir.into()),
+        }
     }
 
-    /// A backend at `$IKIGAI_SECRETS`, then `~/.ikigai/secrets`.
+    /// A backend at `$IKIGAI_SECRETS`, else in the data home (`~/.ikigai/secrets`).
+    ///
+    /// Refuses rather than guessing: with `HOME` unset or empty and no `IKIGAI_SECRETS` there
+    /// is no store, and a store relative to the working directory is never used (nor a
+    /// relative `IKIGAI_SECRETS`), because secrets would land wherever the process happened
+    /// to start.
+    pub fn in_data_dir() -> Result<Self> {
+        store_dir_from(std::env::var_os("IKIGAI_SECRETS"), std::env::var_os("HOME"))
+            .map(FileBackend::new)
+            .map_err(Error::Endpoint)
+    }
+
+    /// The old name of [`in_data_dir`](Self::in_data_dir): the store is DATA, not config.
+    /// Infallible for compatibility, so with no store it returns a backend that refuses every
+    /// operation with the reason (it no longer falls back to a directory relative to the
+    /// working directory).
+    #[deprecated(
+        since = "0.1.7",
+        note = "the store is in the data home; use `FileBackend::in_data_dir`, which refuses \
+                rather than returning a backend that refuses every operation"
+    )]
     pub fn in_config_dir() -> Self {
-        let dir = std::env::var_os("IKIGAI_SECRETS")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".ikigai").join("secrets"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".ikigai-secrets"));
-        FileBackend { dir }
+        Self::in_data_dir_or_refusing()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        let safe: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.dir.join(safe)
+    /// [`in_data_dir`](Self::in_data_dir), or a backend that refuses every operation with the
+    /// reason there is no store — for the infallible [`default_backend`].
+    fn in_data_dir_or_refusing() -> Self {
+        FileBackend {
+            dir: store_dir_from(std::env::var_os("IKIGAI_SECRETS"), std::env::var_os("HOME")),
+        }
     }
+
+    fn dir(&self) -> Result<&Path> {
+        self.dir
+            .as_deref()
+            .map_err(|why| Error::Endpoint(why.clone()))
+    }
+
+    /// The store directory and `name`'s file name in it.
+    fn locate(&self, name: &str) -> Result<(&Path, String)> {
+        Ok((self.dir()?, file_name(name)?))
+    }
+}
+
+/// Where the file store lives: `secrets` (the `IKIGAI_SECRETS` value) when set and non-empty,
+/// else `<home>/.ikigai/secrets`. `Err` naming the fix when there is no absolute answer.
+fn store_dir_from(
+    secrets: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(dir) = secrets.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        return if dir.is_absolute() {
+            Ok(dir)
+        } else {
+            Err(format!(
+                "IKIGAI_SECRETS is `{}`, a path relative to the working directory; the secrets \
+                 store must be an absolute directory",
+                dir.display()
+            ))
+        };
+    }
+    ikigai_core::config::data_home_from(home)
+        .and_then(|home| ikigai_core::config::data_path_in(&home, "secrets"))
+        .filter(|dir| dir.is_absolute())
+        .ok_or_else(|| {
+            "no secrets store: HOME is unset, empty or relative, so there is no \
+             ~/.ikigai/secrets, and secrets are never kept relative to the working directory; \
+             set HOME, or set IKIGAI_SECRETS to an absolute directory"
+                .to_string()
+        })
+}
+
+/// A secret's file name: injective and free of uppercase (see [`FileBackend`]).
+fn file_name(name: &str) -> Result<String> {
+    use std::fmt::Write;
+    if name.is_empty() {
+        return Err(Error::InvalidArgument {
+            name: "name".into(),
+            detail: "an empty name names no secret".into(),
+        });
+    }
+    let mut out = String::with_capacity(name.len());
+    for (i, byte) in name.bytes().enumerate() {
+        let verbatim =
+            matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_') || (byte == b'.' && i > 0);
+        if verbatim {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02x}");
+        }
+    }
+    Ok(out)
+}
+
+/// The refusal for a legacy entry that differs from a name's file only in case.
+fn ambiguous(dir: &Path, file: &str) -> Error {
+    Error::Endpoint(format!(
+        "the secrets store {} holds an entry that differs from `{file}` only in case — written \
+         by ikigai-secret 0.1.6 or earlier, which kept uppercase verbatim. This volume folds \
+         case, so it is the same file, and which name stored it cannot be known; it is refused \
+         rather than guessed. Inspect it at the box, then rename or remove it",
+        dir.display()
+    ))
+}
+
+/// Whether `dir` holds an entry named exactly `file`, byte for byte. Asked only once a file
+/// is known to be there: on a volume that folds case, opening `api-key` also opens a legacy
+/// `API-KEY`, and only the directory listing says which spelling is on disk.
+fn exact_entry(dir: &Path, file: &str) -> Result<bool> {
+    let io = |e: std::io::Error| Error::Endpoint(format!("secret store listing: {e}"));
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        if entry.map_err(io)?.file_name() == std::ffi::OsStr::new(file) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the store directory exists, judging its owner and mode when it does.
+fn check_dir(dir: &Path) -> Result<bool> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {
+            modes::guard(dir, &meta, modes::DIR, |mode| {
+                std::fs::set_permissions(dir, mode)
+            })?;
+            Ok(true)
+        }
+        Ok(_) => Err(Error::Endpoint(format!(
+            "the secrets store {} is not a directory",
+            dir.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::Endpoint(format!(
+            "secrets store {}: {e}",
+            dir.display()
+        ))),
+    }
+}
+
+/// The store directory, created private if it is absent.
+fn ensure_dir(dir: &Path) -> Result<()> {
+    if check_dir(dir)? {
+        return Ok(());
+    }
+    let io = |e: std::io::Error| Error::Endpoint(format!("secrets store {}: {e}", dir.display()));
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, modes::DIR);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    match builder.create(dir) {
+        // Created here: set the mode outright, so the umask cannot have narrowed or widened it.
+        Ok(()) => modes::set(dir, modes::DIR).map_err(io)?,
+        // Created meanwhile by someone else: judged like any existing store, below.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io(e)),
+    }
+    check_dir(dir).map(|_| ())
+}
+
+/// Write `value` to `target` whole: a private temporary file in the store, synced, renamed
+/// over the target. A failure at any point leaves the previous file (or none) and no partial
+/// one; the temporary file is removed.
+fn write_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<()> {
+    use rand_core::RngCore;
+    use std::io::Write;
+    let fail = |e: std::io::Error| Error::Endpoint(format!("secret write: {e}"));
+
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        // Hidden, so never a secret's file name (no name maps to a leading `.`). Random, not
+        // a pid: unique across processes, and `process::id` panics on WASI.
+        let tmp = dir.join(format!(".tmp-{:016x}", rand_core::OsRng.next_u64()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, modes::FILE);
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            // A collision (vanishingly unlikely, but cheap to survive): draw another name.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(fail(e)),
+        }
+    };
+    let written = (|| {
+        modes::set_file(&file, modes::FILE)?;
+        file.write_all(value)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, target)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(fail(e));
+    }
+    // The rename's own durability, best-effort: not every platform can open a directory.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 impl Backend for FileBackend {
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        match std::fs::read(self.path(name)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Endpoint(format!("secret read: {e}"))),
+        use std::io::Read;
+        let (dir, file) = self.locate(name)?;
+        if !check_dir(dir)? {
+            return Ok(None);
         }
+        let path = dir.join(&file);
+        let mut handle = match std::fs::File::open(&path) {
+            Ok(handle) => handle,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Endpoint(format!("secret read: {e}"))),
+        };
+        if !exact_entry(dir, &file)? {
+            return Err(ambiguous(dir, &file));
+        }
+        // On the handle, not the path: what is judged is exactly what is then read.
+        let meta = handle
+            .metadata()
+            .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
+        modes::guard(&path, &meta, modes::FILE, |mode| {
+            handle.set_permissions(mode)
+        })?;
+        let mut bytes = Vec::new();
+        handle
+            .read_to_end(&mut bytes)
+            .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
+        Ok(Some(bytes))
     }
 
     fn set(&self, name: &str, value: &[u8]) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| Error::Endpoint(format!("secret dir: {e}")))?;
-        std::fs::write(self.path(name), value)
-            .map_err(|e| Error::Endpoint(format!("secret write: {e}")))
+        let (dir, file) = self.locate(name)?;
+        ensure_dir(dir)?;
+        let target = dir.join(&file);
+        if target.symlink_metadata().is_ok() && !exact_entry(dir, &file)? {
+            return Err(ambiguous(dir, &file));
+        }
+        write_atomic(dir, &target, value)
     }
 
     fn delete(&self, name: &str) -> Result<()> {
-        match std::fs::remove_file(self.path(name)) {
+        let (dir, file) = self.locate(name)?;
+        if !check_dir(dir)? {
+            return Ok(());
+        }
+        let path = dir.join(&file);
+        if path.symlink_metadata().is_ok() && !exact_entry(dir, &file)? {
+            return Err(ambiguous(dir, &file));
+        }
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Endpoint(format!("secret delete: {e}"))),
+        }
+    }
+
+    fn exists(&self, name: &str) -> Result<bool> {
+        let (dir, file) = self.locate(name)?;
+        if !check_dir(dir)? {
+            return Ok(false);
+        }
+        match dir.join(&file).symlink_metadata() {
+            Ok(_) if exact_entry(dir, &file)? => Ok(true),
+            Ok(_) => Err(ambiguous(dir, &file)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Endpoint(format!("secret lookup: {e}"))),
+        }
+    }
+
+    /// Atomic: [`set`](Backend::set) already renames a whole file over the old one, so a
+    /// replace never deletes first and a failure keeps the previous secret.
+    fn replace(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.set(name, value)
+    }
+}
+
+/// Who may read or write the file store, judged by owner and mode. Unix only: elsewhere there
+/// are no mode bits to judge, and the platform's ACLs govern, as they did before.
+mod modes {
+    use ikigai_core::Result;
+    use std::path::Path;
+
+    /// The store directory's mode.
+    pub const DIR: u32 = 0o700;
+    /// Every secret file's mode.
+    pub const FILE: u32 = 0o600;
+
+    /// What an entry's owner and mode allow.
+    #[derive(Debug, PartialEq, Eq)]
+    #[cfg_attr(not(unix), allow(dead_code))] // judged only where there are mode bits
+    pub enum Exposure {
+        /// Owner-only, owned by this process's user.
+        Private,
+        /// Others can read (or traverse) it but not write it: tightened, and logged once
+        /// (it is private afterwards). Refusing would take the store down while protecting
+        /// nothing already disclosed; tightening stops further disclosure.
+        Tighten,
+        /// Someone else could have written it, so its contents (a key, a recipient) are not
+        /// trusted; tightening now would trust whatever they wrote. A person checks it.
+        Refuse(String),
+    }
+
+    /// Judge `mode` on an entry owned by uid `owner`, read by a process running as uid `me`.
+    /// Pure, so every branch is testable, the foreign-owner one included.
+    #[cfg_attr(not(unix), allow(dead_code))] // judged only where there are mode bits
+    pub fn judge(mode: u32, owner: u32, me: u32) -> Exposure {
+        if owner != me {
+            return Exposure::Refuse(format!(
+                "is owned by uid {owner}, not by this process's uid {me}"
+            ));
+        }
+        if mode & 0o022 != 0 {
+            return Exposure::Refuse(format!(
+                "is writable by its group or by everyone (mode {:04o})",
+                mode & 0o7777
+            ));
+        }
+        if mode & 0o077 != 0 {
+            return Exposure::Tighten;
+        }
+        Exposure::Private
+    }
+
+    /// Refuse an entry someone else could have written; tighten one others can only read,
+    /// through `chmod` (the path for a directory, the open handle for a file).
+    #[cfg(unix)]
+    pub fn guard(
+        path: &Path,
+        meta: &std::fs::Metadata,
+        private: u32,
+        chmod: impl FnOnce(std::fs::Permissions) -> std::io::Result<()>,
+    ) -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: `geteuid` takes no arguments, has no preconditions, and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let mode = meta.mode() & 0o7777;
+        match judge(mode, meta.uid(), me) {
+            Exposure::Private => Ok(()),
+            Exposure::Tighten => {
+                chmod(std::fs::Permissions::from_mode(private)).map_err(|e| {
+                    ikigai_core::Error::Endpoint(format!(
+                        "{} is readable by others (mode {mode:04o}) and could not be tightened \
+                         to {private:04o}: {e}",
+                        path.display()
+                    ))
+                })?;
+                // Logged once: the entry is private from here on, so the next check is silent.
+                eprintln!(
+                    "ikigai-secret: {} was readable by others (mode {mode:04o}); tightened it \
+                     to {private:04o}. Anything in it may already have been read.",
+                    path.display()
+                );
+                Ok(())
+            }
+            Exposure::Refuse(why) => Err(ikigai_core::Error::Endpoint(format!(
+                "refusing the secrets store entry {} : it {why}, so its contents are not \
+                 trusted; check them at the box, then fix it with `chmod {private:o}` (and \
+                 `chown` if it is not yours)",
+                path.display()
+            ))),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn guard(
+        _path: &Path,
+        _meta: &std::fs::Metadata,
+        _private: u32,
+        _chmod: impl FnOnce(std::fs::Permissions) -> std::io::Result<()>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set a path's mode outright (Unix; elsewhere nothing to set).
+    pub fn set(path: &Path, mode: u32) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, mode);
+            Ok(())
+        }
+    }
+
+    /// Set an open file's mode outright (Unix; elsewhere nothing to set).
+    pub fn set_file(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, mode);
+            Ok(())
         }
     }
 }
@@ -642,6 +1124,20 @@ impl Backend for KeychainBackend {
             Err(e) if e.code() == -25300 => Ok(()),
             Err(e) => Err(Error::Endpoint(format!("keychain delete: {e}"))),
         }
+    }
+
+    /// DELETE then SET, deliberately: a plain update would keep an existing item's access
+    /// control (e.g. one the `security` CLI created, which re-prompts a code-signed reader).
+    /// Re-adding the item re-homes its ACL to whoever writes it — this process — so the
+    /// owner's daemon then reads it without a Keychain prompt.
+    ///
+    /// ⚠ Not atomic: a `set` that fails after the `delete` loses the previous secret. The
+    /// atomic form (add the new item under a temporary account, delete the old one, then
+    /// rename the new one with `SecItemUpdate`) needs the Keychain to test, so it waits for an
+    /// arc run on the machine.
+    fn replace(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.delete(name)?;
+        self.set(name, value)
     }
 }
 
@@ -723,6 +1219,17 @@ impl Backend for SecureEnclaveBackend {
     fn set(&self, _name: &str, _value: &[u8]) -> Result<()> {
         Err(Error::Endpoint(
             "a Secure-Enclave key cannot be set from bytes — use generate_signing_key".into(),
+        ))
+    }
+
+    /// Refused BEFORE anything is deleted: [`set`](Backend::set) can never succeed here, so
+    /// the default delete-then-set would destroy a non-extractable key for good and store
+    /// nothing in its place.
+    fn replace(&self, _name: &str, _value: &[u8]) -> Result<()> {
+        Err(Error::Endpoint(
+            "a Secure-Enclave key cannot be replaced from bytes (it would be deleted and \
+             nothing stored) — generate a new key with generate_signing_key"
+                .into(),
         ))
     }
 
@@ -1126,7 +1633,11 @@ mod tests {
         let (repr, _) = Resolver::issue_as(
             &kernel,
             generate_req("signing-key"),
-            &Capability::scoped(["urn:cap:secret:generate"]),
+            &Capability::scoped([
+                "urn:cap:secret:generate",
+                "urn:cap:secret:write:signing-key",
+                "urn:cap:secret:write:signing-key.pub",
+            ]),
         )
         .expect("granted generate resolves");
 
@@ -1157,5 +1668,215 @@ mod tests {
         verifying
             .verify(msg, &sig)
             .expect("stored private/public keypair matches");
+    }
+
+    // ---- the file store's name mapping (ledger #854, B1) ----
+
+    /// The inverse of [`file_name`]: proof by construction that the mapping is injective.
+    fn decode(file: &str) -> Vec<u8> {
+        let bytes = file.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_file_name_mapping_is_reversible_lowercase_and_never_hidden() {
+        let names = [
+            "a",
+            "A",
+            "api-key",
+            "API-KEY",
+            "Api-Key",
+            "team:db",
+            "team_db",
+            "team%3adb",
+            "%",
+            ".",
+            "..",
+            "...",
+            ".hidden",
+            "a.b.pub",
+            "a/b",
+            "../x",
+            "шифр",
+            "ключ",
+            "e\u{301}",
+            "\u{e9}",
+            "sp ace",
+            "x\0y",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for name in names {
+            let file = file_name(name).unwrap();
+            assert_eq!(
+                decode(&file),
+                name.as_bytes(),
+                "{name} → {file} decodes back"
+            );
+            assert!(
+                file.bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'%')),
+                "{name} → {file}: only lowercase-safe bytes"
+            );
+            assert!(
+                !file.starts_with('.'),
+                "{name} → {file}: never hidden, never . or .."
+            );
+            // Distinct names, distinct files, even folded: the outputs carry no uppercase, so
+            // folding is the identity on them.
+            if let Some(other) = seen.insert(file.to_lowercase(), name) {
+                panic!("{name} and {other} share the file {file}");
+            }
+        }
+        assert!(file_name("").is_err(), "an empty name names nothing");
+    }
+
+    #[test]
+    fn names_of_the_safe_set_keep_the_file_name_earlier_versions_gave_them() {
+        for name in [
+            "cms-passkeys",
+            "zotero-api-key",
+            "brian.sign",
+            "brian.enc.pub",
+            "team_db",
+            "k1",
+        ] {
+            assert_eq!(file_name(name).unwrap(), name);
+        }
+        assert_eq!(file_name("team:db").unwrap(), "team%3adb");
+        assert_eq!(file_name("API-KEY").unwrap(), "%41%50%49-%4b%45%59");
+    }
+
+    // ---- the file store's modes (B2) ----
+
+    #[test]
+    fn modes_are_judged_owner_first_then_writable_then_readable() {
+        use modes::{judge, Exposure};
+        assert_eq!(judge(0o600, 501, 501), Exposure::Private);
+        assert_eq!(judge(0o700, 501, 501), Exposure::Private);
+        assert_eq!(judge(0o644, 501, 501), Exposure::Tighten);
+        assert_eq!(judge(0o755, 501, 501), Exposure::Tighten);
+        assert_eq!(judge(0o710, 501, 501), Exposure::Tighten);
+        assert!(matches!(judge(0o620, 501, 501), Exposure::Refuse(w) if w.contains("writable")));
+        assert!(matches!(judge(0o602, 501, 501), Exposure::Refuse(w) if w.contains("writable")));
+        assert!(matches!(judge(0o777, 501, 501), Exposure::Refuse(_)));
+        assert!(matches!(judge(0o600, 0, 501), Exposure::Refuse(w) if w.contains("uid 0")));
+    }
+
+    // ---- the store's location (ledger #203) ----
+
+    #[test]
+    fn the_store_is_in_the_data_home_or_refused_never_relative() {
+        use std::ffi::OsString;
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(
+            store_dir_from(None, os("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.ikigai/secrets")
+        );
+        assert_eq!(
+            store_dir_from(os("/srv/keys"), os("/home/u")).unwrap(),
+            PathBuf::from("/srv/keys"),
+            "IKIGAI_SECRETS wins"
+        );
+        assert_eq!(
+            store_dir_from(os(""), os("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.ikigai/secrets"),
+            "an empty IKIGAI_SECRETS is unset"
+        );
+        for (secrets, home) in [
+            (None, None),
+            (None, os("")),
+            (os(""), None),
+            (None, os("rel")),
+        ] {
+            let why = store_dir_from(secrets.clone(), home.clone()).unwrap_err();
+            assert!(
+                why.contains("HOME") && why.contains("IKIGAI_SECRETS"),
+                "{secrets:?}/{home:?}: names how to configure it: {why}"
+            );
+        }
+        let why = store_dir_from(os("keys"), os("/home/u")).unwrap_err();
+        assert!(
+            why.contains("relative"),
+            "a relative IKIGAI_SECRETS is refused: {why}"
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_store_refuses_every_operation() {
+        let backend = FileBackend {
+            dir: store_dir_from(None, None),
+        };
+        for result in [
+            backend.get("k").map(|_| ()),
+            backend.set("k", b"v"),
+            backend.delete("k"),
+            backend.exists("k").map(|_| ()),
+            backend.replace("k", b"v"),
+        ] {
+            let err = result.expect_err("no store, no operation");
+            assert!(err.to_string().contains("IKIGAI_SECRETS"), "{err}");
+        }
+    }
+
+    // ---- replacing (B3) ----
+
+    /// Sink over the Enclave refuses before deleting: `set` can never succeed there, so a
+    /// delete-then-set would destroy the key. No Security call is made on this path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacing_an_enclave_key_from_bytes_is_refused_before_anything_is_deleted() {
+        let backend = SecureEnclaveBackend::new("ikigai-secret-test-never-created");
+        let err = backend
+            .replace("k", b"v")
+            .expect_err("an Enclave key is never replaced from bytes");
+        assert!(err.to_string().contains("cannot be replaced"), "{err}");
+    }
+
+    /// A store whose `.pub` writes fail: the private half must not be left behind.
+    #[cfg(not(target_os = "macos"))]
+    struct PublicHalfFails(FileBackend);
+
+    #[cfg(not(target_os = "macos"))]
+    impl Backend for PublicHalfFails {
+        fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+            self.0.get(name)
+        }
+        fn set(&self, name: &str, value: &[u8]) -> Result<()> {
+            if name.ends_with(".pub") {
+                return Err(Error::Endpoint("disk full".into()));
+            }
+            self.0.set(name, value)
+        }
+        fn delete(&self, name: &str) -> Result<()> {
+            self.0.delete(name)
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn generate_never_leaves_half_a_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(PublicHalfFails(FileBackend::new(dir.path())));
+        let kernel = ikigai_core::Kernel::new(Arc::new(space(backend.clone())));
+        let err = Resolver::issue_as(&kernel, generate_req("half"), &Capability::root())
+            .expect_err("the public half cannot be written");
+        assert!(err.to_string().contains("stored nothing"), "{err}");
+        assert!(
+            backend.get("half").unwrap().is_none(),
+            "the private half was removed"
+        );
+        assert!(backend.get("half.pub").unwrap().is_none());
     }
 }
