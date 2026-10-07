@@ -8,7 +8,7 @@
 //! directory, seeded with one secret the `{name}` binding names. The Keychain
 //! backend is macOS/TCC and cannot run in CI or from an agent shell, so it is not
 //! walked; the endpoints are the same code over either store. The backend is
-//! wrapped in [`Recording`], which logs every `get`/`set`/`delete` by name — the
+//! wrapped in [`Recording`], which logs every `Backend` call by name — the
 //! only witness to what the walk touched, and to what a refused call did NOT.
 //!
 //! ## Declarations, and why each
@@ -57,8 +57,8 @@
 //! - **The walk mutates the fixture** (PENDING #13/#40): PIPELINE fires the Sink
 //!   under root with `content=x`, so after [`conforms`] the seeded secret IS `x`.
 //!   Asserted, with the exact backend log: one `get` (the cache probe's single
-//!   resolution — `Always` returns before a second), one `delete` + one `set` (the
-//!   pipeline probe's Sink, fired once) — and nothing under no grants.
+//!   resolution — `Always` returns before a second), one `replace` (the pipeline
+//!   probe's Sink, fired once) — and nothing under no grants.
 
 use ikigai_conformance::{Check, Checks, Fixture, Report, Suite};
 use ikigai_core::{
@@ -90,6 +90,8 @@ enum Op {
     Get(String),
     Set(String),
     Delete(String),
+    Exists(String),
+    Replace(String),
 }
 
 /// A backend that logs every operation by name and delegates to the file store.
@@ -108,7 +110,9 @@ impl Recording {
         self.ops()
             .into_iter()
             .filter(|op| match op {
-                Op::Get(n) | Op::Set(n) | Op::Delete(n) => n == name,
+                Op::Get(n) | Op::Set(n) | Op::Delete(n) | Op::Exists(n) | Op::Replace(n) => {
+                    n == name
+                }
             })
             .collect()
     }
@@ -130,6 +134,14 @@ impl Backend for Recording {
     fn delete(&self, name: &str) -> ikigai_core::Result<()> {
         self.log.lock().unwrap().push(Op::Delete(name.into()));
         self.inner.delete(name)
+    }
+    fn exists(&self, name: &str) -> ikigai_core::Result<bool> {
+        self.log.lock().unwrap().push(Op::Exists(name.into()));
+        self.inner.exists(name)
+    }
+    fn replace(&self, name: &str, value: &[u8]) -> ikigai_core::Result<()> {
+        self.log.lock().unwrap().push(Op::Replace(name.into()));
+        self.inner.replace(name, value)
     }
 }
 
@@ -237,15 +249,11 @@ fn conforms() {
 
     // The walk's footprint on the keystore, exactly: the cache probe read the
     // seeded secret once (`Always` needs no second resolution), the pipeline
-    // probe fired the Sink once (delete + set), and ENFORCED — under no grants —
-    // never reached the store.
+    // probe fired the Sink once (one `replace`: the file store's is atomic, never a
+    // delete then a set), and ENFORCED — under no grants — never reached the store.
     assert_eq!(
         backend.ops_on(NAME),
-        [
-            Op::Get(NAME.into()),
-            Op::Delete(NAME.into()),
-            Op::Set(NAME.into())
-        ],
+        [Op::Get(NAME.into()), Op::Replace(NAME.into())],
         "the walk's footprint on the seeded secret"
     );
     // PENDING #40: the walk mutates the fixture — the seeded secret is now the
@@ -255,17 +263,26 @@ fn conforms() {
         Some(PROBE_CONTENT),
         "the pipeline probe's Sink landed"
     );
-    // Wherever generate was walked, its minimal call (`into=x`) minted a pair.
+    // Wherever generate was walked, its minimal call (`into=x`) checked that
+    // neither name held a secret (generate never replaces), then minted the pair.
     let minted: Vec<Op> = backend
         .ops()
         .into_iter()
-        .filter(|op| matches!(op, Op::Set(n) if n == "x" || n == "x.pub"))
+        .filter(|op| matches!(op, Op::Set(n) | Op::Exists(n) if n == "x" || n == "x.pub"))
         .collect();
     if BIOMETRIC_WALKED {
-        assert_eq!(minted, [Op::Set("x".into()), Op::Set("x.pub".into())]);
+        assert_eq!(
+            minted,
+            [
+                Op::Exists("x".into()),
+                Op::Exists("x.pub".into()),
+                Op::Set("x".into()),
+                Op::Set("x.pub".into())
+            ]
+        );
         assert_eq!(
             backend.ops().len(),
-            5,
+            6,
             "and nothing else: {:?}",
             backend.ops()
         );
@@ -273,7 +290,7 @@ fn conforms() {
         assert!(minted.is_empty(), "opted out: nothing minted: {minted:?}");
         assert_eq!(
             backend.ops().len(),
-            3,
+            2,
             "and nothing else: {:?}",
             backend.ops()
         );
@@ -489,7 +506,8 @@ fn required_inputs_are_required() {
         Verb::Source,
         GENERATE_IRI,
         &[],
-        &scoped(&["urn:cap:secret:generate"]),
+        // The declared floor (generate, and SOME write grant): what is missing is `into`.
+        &scoped(&["urn:cap:secret:generate", "urn:cap:secret:write:k"]),
     )
     .unwrap_err();
     assert!(
@@ -633,24 +651,30 @@ fn names_are_wave_two() {
 
 /// The contract as the manifold states it: `urn:secret` has a Source under the
 /// read wildcard and a Sink under the write wildcard, each binding `name`, the
-/// Sink requiring `content`; unlock and generate each one Source under their own
-/// exact capability; every input has a class; generate's `into` is required and
+/// Sink requiring `content`; unlock one Source under its own exact capability;
+/// generate one Source under its own capability AND the write wildcard (it writes
+/// `<into>` and `<into>.pub`, whose exact scopes it checks at invoke); every input
+/// has a class; generate's `into` is required and
 /// its `type` is optional with a default among its `one_of`.
 #[test]
 fn the_manifold_states_the_contract() {
-    /// One action's contract: verb, the scope it requires, its inputs and whether
+    /// One action's contract: verb, the scopes it requires, its inputs and whether
     /// each is required.
-    type Action = (Verb, &'static str, Vec<(&'static str, bool)>);
+    type Action = (Verb, &'static [&'static str], Vec<(&'static str, bool)>);
     let (kernel, _backend, _dir) = fixture();
     let contract: [(&str, &str, Vec<Action>); 3] = [
         (
             SECRET_TEMPLATE,
             SECRET,
             vec![
-                (Verb::Source, "urn:cap:secret:read:*", vec![("name", true)]),
+                (
+                    Verb::Source,
+                    &["urn:cap:secret:read:*"],
+                    vec![("name", true)],
+                ),
                 (
                     Verb::Sink,
-                    "urn:cap:secret:write:*",
+                    &["urn:cap:secret:write:*"],
                     vec![("name", true), ("content", true)],
                 ),
             ],
@@ -658,14 +682,14 @@ fn the_manifold_states_the_contract() {
         (
             UNLOCK_IRI,
             UNLOCK,
-            vec![(Verb::Source, "urn:cap:secret:unlock", vec![])],
+            vec![(Verb::Source, &["urn:cap:secret:unlock"], vec![])],
         ),
         (
             GENERATE_IRI,
             GENERATE,
             vec![(
                 Verb::Source,
-                "urn:cap:secret:generate",
+                &["urn:cap:secret:generate", "urn:cap:secret:write:*"],
                 vec![("into", true), ("type", false)],
             )],
         ),
@@ -678,8 +702,7 @@ fn the_manifold_states_the_contract() {
         for (spec, (verb, requires, inputs)) in specs.iter().zip(actions) {
             assert_eq!(spec.verb, verb, "{id}");
             assert_eq!(
-                spec.requires,
-                [requires],
+                spec.requires, requires,
                 "{id} {verb:?}: declared = enforced"
             );
             let declared: Vec<(&str, bool)> = spec
