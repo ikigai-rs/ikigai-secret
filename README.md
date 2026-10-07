@@ -147,6 +147,9 @@ only verbatim-set names. What changes for a caller:
 - **The write face takes any bytes** (the second audit's S3): `content` is no longer required
   to be UTF-8, so a binary secret the read face serves as `application/octet-stream` can be
   replaced through the resource.
+- **Secure Enclave ES256 signatures leave low-S** (ledger #860): `der_ecdsa_to_fixed_rs`
+  reflects a high s to n − s (and refuses s ≥ n), so `ikigai-sign`'s verifier, which refuses
+  high-S, accepts every Enclave signature rather than about half of them.
 - `ikigai-core` floor `0.1.46` → `0.1.58` (`config::data_home_from`).
 
 ## Next slices

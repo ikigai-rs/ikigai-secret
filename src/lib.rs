@@ -145,6 +145,13 @@ pub fn p256_point_to_spki(point: &[u8]) -> Result<Vec<u8>> {
     Ok(spki)
 }
 
+/// The order n of the P-256 group, big-endian: the modulus ECDSA's s lives under, and what
+/// [`der_ecdsa_to_fixed_rs`] reflects a high s through (s → n − s).
+const P256_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
+
 /// Read one DER `INTEGER` at `*i` in `der` into a 32-byte big-endian P-256 scalar, advancing
 /// `*i`. Strips DER's positive-sign leading zero and left-pads a short scalar.
 fn read_der_scalar(der: &[u8], i: &mut usize) -> Result<[u8; 32]> {
@@ -170,9 +177,34 @@ fn read_der_scalar(der: &[u8], i: &mut usize) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// The low-S form of a P-256 ECDSA `s`: the smaller of s and n − s. Because n is odd,
+/// s ≤ ⌊n/2⌋ exactly when s < n − s, so no half-order constant is needed. Big-endian byte
+/// arrays of equal length compare as the integers they encode. Refuses s ≥ n.
+fn low_s(s: [u8; 32]) -> Result<[u8; 32]> {
+    if s >= P256_ORDER {
+        return Err(Error::Endpoint(
+            "malformed ECDSA DER signature: s is not below the P-256 group order".into(),
+        ));
+    }
+    // n − s, schoolbook from the least significant byte; s < n, so no borrow survives.
+    let mut reflected = [0u8; 32];
+    let mut borrow = 0u16;
+    for k in (0..32).rev() {
+        let diff = 0x100 + u16::from(P256_ORDER[k]) - u16::from(s[k]) - borrow;
+        reflected[k] = diff as u8; // keep the low byte: the digit in base 256
+        borrow = 1 - (diff >> 8);
+    }
+    Ok(if reflected < s { reflected } else { s })
+}
+
 /// Convert a DER-encoded ECDSA signature (`SEQUENCE { INTEGER r, INTEGER s }`, as the Enclave /
 /// `SecKeyCreateSignature` emits) into the fixed 64-byte `r‖s` form ES256 uses on the wire and
 /// `ikigai-sign` verifies. P-256, so each scalar is 32 bytes big-endian.
+///
+/// The result is always **low-S** (s ≤ n/2). ECDSA accepts both s and n − s, the Enclave's
+/// randomized signer emits either, and `ikigai-sign`'s verifier accepts only the low half (so a
+/// signature has one encoding), so a high s is reflected to n − s here. An s ≥ n is not a
+/// P-256 scalar and is refused.
 pub fn der_ecdsa_to_fixed_rs(der: &[u8]) -> Result<[u8; 64]> {
     let bad = |m: &str| Error::Endpoint(format!("malformed ECDSA DER signature: {m}"));
     let mut i = 0;
@@ -184,7 +216,7 @@ pub fn der_ecdsa_to_fixed_rs(der: &[u8]) -> Result<[u8; 64]> {
     let _seq_len = *der.get(i).ok_or_else(|| bad("truncated"))?;
     i += 1;
     let r = read_der_scalar(der, &mut i)?;
-    let s = read_der_scalar(der, &mut i)?;
+    let s = low_s(read_der_scalar(der, &mut i)?)?;
     let mut sig = [0u8; 64];
     sig[..32].copy_from_slice(&r);
     sig[32..].copy_from_slice(&s);
@@ -1253,7 +1285,8 @@ impl Backend for SecureEnclaveBackend {
             None => return Ok(None),
         };
         // ECDSASignatureMessageX962SHA256 = ES256: the Enclave hashes with SHA-256 and signs,
-        // emitting an X9.62 DER signature — normalised to fixed r‖s below.
+        // emitting an X9.62 DER signature, high-S about half the time. The converter turns it
+        // into the fixed, LOW-S r‖s that ikigai-sign's verifier accepts (ledger #860).
         let der = key
             .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, message)
             .map_err(|e| Error::Endpoint(format!("enclave sign: {e}")))?;
@@ -1322,10 +1355,70 @@ mod tests {
         let sk = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
         let sig: Signature = sk.sign(b"the Enclave signs this one day");
         // Convert the DER form (what SecKeyCreateSignature emits) → our fixed r‖s, and it must
-        // match p256's own canonical 64-byte encoding of the same signature.
+        // match p256's own canonical 64-byte encoding of the same signature, in its low-S form
+        // (p256 0.13 does not normalize when it signs; the converter always does, ledger #860).
         let der = sig.to_der();
         let fixed = der_ecdsa_to_fixed_rs(der.as_bytes()).unwrap();
-        assert_eq!(&fixed[..], &sig.to_bytes()[..]);
+        let canonical = sig.normalize_s().unwrap_or(sig);
+        assert_eq!(&fixed[..], &canonical.to_bytes()[..]);
+    }
+
+    /// Ledger #860: the Enclave's ECDSA is randomized and emits whichever s it computed, so about
+    /// half its signatures are HIGH-S, and ikigai-sign's `verify_es256` refuses those (it accepts
+    /// only the canonical low-S form). The converter must hand back the low-S twin.
+    #[test]
+    fn a_high_s_der_signature_converts_to_the_low_s_fixed_rs() {
+        use p256::ecdsa::signature::{Signer, Verifier};
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::scalar::IsHigh;
+
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let message = b"half of the Enclave's signatures look like this";
+        // p256 0.13 does NOT normalize when it signs (P-256's `NORMALIZE_S` is off), so take
+        // the low-S twin explicitly.
+        let signed: Signature = sk.sign(message);
+        let low = signed.normalize_s().unwrap_or(signed);
+        assert!(low.normalize_s().is_none(), "the low twin is low-S");
+        // The same signature with s replaced by n − s: equally valid ECDSA, but high-S.
+        let (r, s) = low.split_scalars();
+        let high = Signature::from_scalars(r, -*s).unwrap();
+        assert!(bool::from(high.s().is_high()), "the twin is high-S");
+
+        let rs = der_ecdsa_to_fixed_rs(high.to_der().as_bytes()).unwrap();
+        let out = Signature::from_slice(&rs).unwrap();
+        assert!(out.normalize_s().is_none(), "the converter returns low-S");
+        assert_eq!(out, low, "and it is exactly the low-S twin");
+        sk.verifying_key().verify(message, &out).unwrap();
+    }
+
+    /// The normalization agrees with p256's own `normalize_s` across many signatures, both halves.
+    #[test]
+    fn low_s_normalization_matches_p256_across_many_signatures() {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        for k in 1u8..=64 {
+            let sk = SigningKey::from_bytes((&[k; 32]).into()).unwrap();
+            let low: Signature = sk.sign(&[k; 7]);
+            let (r, s) = low.split_scalars();
+            let high = Signature::from_scalars(r, -*s).unwrap();
+            for sig in [low, high] {
+                let want = sig.normalize_s().unwrap_or(sig);
+                let rs = der_ecdsa_to_fixed_rs(sig.to_der().as_bytes()).unwrap();
+                assert_eq!(&rs[..], &want.to_bytes()[..], "key byte {k}");
+            }
+        }
+    }
+
+    /// s ≥ n is not a P-256 scalar, so there is no low-S twin to return: refuse it.
+    #[test]
+    fn an_s_at_or_above_the_group_order_is_refused() {
+        let mut der = vec![0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00];
+        der.extend_from_slice(&P256_ORDER);
+        assert!(der_ecdsa_to_fixed_rs(&der).is_err(), "s = n");
+        let mut der = vec![0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00];
+        der.extend_from_slice(&[0xff; 32]);
+        assert!(der_ecdsa_to_fixed_rs(&der).is_err(), "s > n");
     }
 
     #[test]
@@ -1390,6 +1483,25 @@ mod tests {
         let sig = Signature::from_slice(&signed.signature).expect("r‖s parses");
         key.verify(message, &sig)
             .expect("the enclave signature verifies");
+        // ikigai-sign refuses high-S (ledger #860), and the Enclave emits it about half the time:
+        // every signature leaving `sign` must be the low-S form. Sign a few, so a missing
+        // normalization cannot pass on a lucky draw (each draw is ~1/2).
+        assert!(
+            sig.normalize_s().is_none(),
+            "the enclave signature is low-S"
+        );
+        for n in 0..16u8 {
+            let more = backend
+                .sign(name, &[n; 9])
+                .expect("enclave sign")
+                .expect("there is a key to sign with");
+            let more = Signature::from_slice(&more.signature).expect("r‖s parses");
+            assert!(
+                more.normalize_s().is_none(),
+                "enclave signature {n} is low-S"
+            );
+            key.verify(&[n; 9], &more).expect("and it verifies");
+        }
 
         backend.delete(name).expect("cleanup");
     }
