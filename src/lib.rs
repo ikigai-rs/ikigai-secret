@@ -34,6 +34,10 @@
 //! endpoints ahead of the `{name}` template (see [`space`]). A refused call never reaches
 //! the keystore, so an ungranted caller cannot learn whether a name exists; a secret read
 //! is never cacheable. `tests/conformance.rs` holds all of that to `ikigai-conformance`.
+//!
+//! A secret's name never begins with `-`: there it would put the `-` where a capability scope
+//! marks an exclusion, which no grant can cover (`ikigai_core::is_deny_scope`, core 0.1.86).
+//! Every face, the file store included, refuses such a name before any capability check.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -344,6 +348,31 @@ pub const GENERATE_IRI: &str = "urn:secret:generate";
 /// The names the reserved operations take from the `{name}` template: never a secret's name.
 const RESERVED: [&str; 2] = ["unlock", "generate"];
 
+/// Refuse a secret name that begins with `-`, naming `arg` (the input it arrived in).
+///
+/// A secret's name is the last segment of its scopes, `urn:cap:secret:read:<name>` and
+/// `urn:cap:secret:write:<name>`, and that is the position `ikigai_core::is_deny_scope`
+/// (core 0.1.86) reserves across `urn:cap:` for an EXCLUSION: with a leading `-` the token is
+/// deny-shaped, kept through every narrowing and never granted by `Capability::allows`. So a
+/// grant for such a name could never be honored, and the caller would see a bare `Denied` for
+/// the very scope they hold. Refused as an invalid name instead, before any capability check
+/// and whatever core is linked, so the answer is the same on every version.
+fn refuse_deny_shaped(name: &str, arg: &str) -> Result<()> {
+    if name.starts_with('-') {
+        return Err(Error::InvalidArgument {
+            name: arg.into(),
+            detail: format!(
+                "`{name}` begins with `-`, which no secret name may: its scopes \
+                 (`urn:cap:secret:read:{name}`, `urn:cap:secret:write:{name}`) would put the \
+                 `-` where a capability scope marks an exclusion, and an exclusion is never \
+                 granted, so no capability could ever allow it; choose a name that does not \
+                 begin with `-`"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// The stored-secret endpoint: `urn:secret:{name}`, `Source` under
 /// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`. The
 /// capability is checked BEFORE the keystore is consulted, so an ungranted caller learns
@@ -360,6 +389,8 @@ impl Endpoint for SecretEndpoint {
             .get("name")
             .map(|s| s.to_string())
             .ok_or_else(|| Error::MissingArgument("name".into()))?;
+        // Before the capability check: no grant could cover such a name (see the function).
+        refuse_deny_shaped(&name, "name")?;
         match inv.request.verb {
             Verb::Source => {
                 // The kernel already enforced the declared `urn:cap:secret:read:*` floor
@@ -543,6 +574,12 @@ impl Endpoint for GenerateEndpoint {
         if inv.request.verb != Verb::Source {
             return Err(Error::Endpoint("urn:secret:generate is a Source".into()));
         }
+        // A key name no grant could cover is refused before any capability check (see
+        // `refuse_deny_shaped`). Only a readable `into` is judged here; a missing or unreadable
+        // one is reported where it always was, after the gate.
+        if let Ok(key) = inv.inline_str("into") {
+            refuse_deny_shaped(key, "into")?;
+        }
         // Cap-gate FIRST (default-deny), then prove biometric, then store.
         if !inv.capability.allows("urn:cap:secret:generate") {
             return Err(Error::Denied(
@@ -675,6 +712,10 @@ impl Endpoint for GenerateEndpoint {
 /// - every other byte of the name's UTF-8, uppercase ASCII included, is written as `%` and
 ///   two lowercase hex digits (`API-KEY` → `%41%50%49-%4b%45%59`, `team:db` → `team%3adb`).
 ///
+/// A name that is empty or begins with `-` is refused by every operation: the resource refuses
+/// a leading `-` because no capability could grant it, and the store refuses what the resource
+/// does.
+///
 /// No file name the mapping produces contains an uppercase letter, so two distinct names are
 /// two distinct files even on a volume that folds case. A name made only of the verbatim set
 /// keeps the file name every earlier version gave it, so an existing store of such names
@@ -786,6 +827,9 @@ fn file_name(name: &str) -> Result<String> {
             detail: "an empty name names no secret".into(),
         });
     }
+    // The store refuses what the resource refuses, so a name no grant could ever cover is not
+    // creatable through the library either.
+    refuse_deny_shaped(name, "name")?;
     let mut out = String::with_capacity(name.len());
     for (i, byte) in name.bytes().enumerate() {
         let verbatim =

@@ -52,6 +52,14 @@ never inlined, never cached.
   … | urn:encrypt:decrypt key=urn:secret:brian.enc
   ```
 
+**A secret's name never begins with `-`.** The name is the last segment of its scopes
+(`urn:cap:secret:read:<name>`, `urn:cap:secret:write:<name>`), and since `ikigai-core` 0.1.86
+that position, with a leading `-`, marks an EXCLUSION (`is_deny_scope`), which `allows()` never
+grants: a grant for `-x` could never be honored. So the read face, the write face, generate's
+`into` and the file store's own API all refuse such a name with an `InvalidArgument` that says
+why, before any capability check and whatever core is linked. A `-` anywhere else in a name is
+just a character (`api-key`).
+
 A host uses the `Backend` directly (e.g. a relying party storing credential material
 in the Keychain instead of a plaintext file), or mounts `space()` for cap-scoped reads
 and writes through the kernel.
@@ -151,6 +159,17 @@ only verbatim-set names. What changes for a caller:
   reflects a high s to n − s (and refuses s ≥ n), so `ikigai-sign`'s verifier, which refuses
   high-S, accepts every Enclave signature rather than about half of them.
 - `ikigai-core` floor `0.1.46` → `0.1.58` (`config::data_home_from`).
+
+## Unreleased
+
+- **A name beginning with `-` is refused** at every face (ledger #874; see "A secret's name
+  never begins with `-`", above). Before, such a name was creatable through the write face and
+  generate by a caller holding its exact write scope (or root) on `ikigai-core` 0.1.85 and
+  earlier, and on 0.1.86 every non-root caller got a bare `Denied` for the scope they held. A
+  file store holding one keeps it on disk, but the store no longer serves it: rename the file
+  at the box (the file name is the secret's name, `-` kept verbatim) and read it under the new
+  name. The library's `ikigai-core` floor is unchanged (`0.1.58`): the refusal uses no new
+  core API, and it behaves the same on every core version.
 
 ## Next slices
 
