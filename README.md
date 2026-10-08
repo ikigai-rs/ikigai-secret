@@ -160,7 +160,7 @@ only verbatim-set names. What changes for a caller:
   high-S, accepts every Enclave signature rather than about half of them.
 - `ikigai-core` floor `0.1.46` → `0.1.58` (`config::data_home_from`).
 
-## Unreleased
+## 0.1.8 (2026-10-07)
 
 - **A name beginning with `-` is refused** at every face (ledger #874; see "A secret's name
   never begins with `-`", above). Before, such a name was creatable through the write face and

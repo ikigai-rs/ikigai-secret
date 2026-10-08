@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
