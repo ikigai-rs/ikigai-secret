@@ -50,14 +50,19 @@ robius-authentication = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-# Resolver::issue_as drives the capability-gating test.
-ikigai-resolve = "0.1.9"
+# Resolver::issue_as drives the capability-gating test. 0.1.28 is the floor that builds
+# against the ikigai-core conformance 0.6 pulls in (0.1.89+): 0.1.27 and below construct
+# core's `Resolved` by struct literal, which core's levels fields (private) refuse.
+ikigai-resolve = "0.1.28"
 futures = "0.3"
 tempfile = "3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
-# reports every violation at once. Its own floor on ikigai-core (0.1.67) is above the
-# library's; the library's pin stays the true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.2.0"
+# reports every violation at once. 0.6.0 is the newest published (SPACE-NAME, ledger #987).
+# Under 0.x caret rules this pin is a CEILING too: "0.6.0" means <0.7.0, so a 0.7 needs a
+# deliberate bump here. Its own floor on ikigai-core (0.1.89) is far above the library's,
+# and it pulls that core into every test build; `[dependencies] ikigai-core` is NOT raised
+# to match, because the library's pin states the true minimum of the API the LIBRARY uses.
+ikigai-conformance = "0.6.0"
 # Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
 # canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
