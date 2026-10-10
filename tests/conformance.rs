@@ -34,6 +34,17 @@
 //!   pins it on every platform. Off macOS the prompt is a no-op and both are
 //!   walked: the ubuntu CI job covers what the macOS job cannot.
 //!
+//! - Both space constructors are declared **host-named** (`SPACE-NAME`, ledger #987):
+//!   [`ikigai_secret::space`] is parameterized by the backend it is handed, and
+//!   [`ikigai_secret::default_space`] builds over the ambient platform backend (the
+//!   Keychain on macOS, a directory read from the environment elsewhere), so neither
+//!   is configuration-free and only the host knows which instance it holds. The
+//!   fixture's own `space(backend)` is declared by value, the same `Arc` the kernel
+//!   walks. `default_space()` is CONSTRUCTED for its declaration and nothing more:
+//!   building it touches no keystore (the Keychain backend holds a service name until
+//!   it is called; the file backend reads two environment variables), and the check
+//!   reads only `id()` and `topology()`, so it is never invoked.
+//!
 //! No module namespace: there is no RDF face (a secret has no graph to skolemize).
 //!
 //! ## What the suite cannot see, pinned by hand
@@ -60,10 +71,10 @@
 //!   resolution — `Always` returns before a second), one `replace` (the pipeline
 //!   probe's Sink, fired once) — and nothing under no grants.
 
-use ikigai_conformance::{Check, Checks, Fixture, Report, Suite};
+use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Description, Error, Expiry, Iri, Kernel, MetaRenderer, ReprType,
-    Representation, Request, Verb,
+    ArgRef, Capability, Description, EndpointSpace, Error, Expiry, Iri, Kernel, MetaRenderer,
+    ReprType, Representation, Request, Verb,
 };
 use ikigai_secret::{Backend, FileBackend, GENERATE_IRI, UNLOCK_IRI};
 use std::sync::{Arc, Mutex};
@@ -166,28 +177,45 @@ impl MetaRenderer for EveryField {
 /// A fresh fixture: the file keystore over a scratch directory, seeded with one
 /// secret, logged. The directory lives as long as the guard.
 fn fixture() -> (Kernel, Arc<Recording>, tempfile::TempDir) {
+    let (kernel, _space, backend, dir) = fixture_with_space();
+    (kernel, backend, dir)
+}
+
+/// [`fixture`], plus the space the kernel walks — the one `Arc`, so the suite's
+/// host-named declaration is the very instance under test.
+fn fixture_with_space() -> (
+    Kernel,
+    Arc<EndpointSpace>,
+    Arc<Recording>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("scratch dir");
     let backend = Arc::new(Recording {
         inner: FileBackend::new(dir.path()),
         log: Mutex::new(Vec::new()),
     });
     backend.inner.set(NAME, VALUE).expect("seed");
-    let kernel = Kernel::with_meta_renderer(
-        Arc::new(ikigai_secret::space(backend.clone())),
-        Arc::new(EveryField),
-    );
-    (kernel, backend, dir)
+    let space = Arc::new(ikigai_secret::space(backend.clone()));
+    let kernel = Kernel::with_meta_renderer(space.clone(), Arc::new(EveryField));
+    (kernel, space, backend, dir)
 }
+
+/// The labels the two space constructors are declared under.
+const SPACE_LABEL: &str = "ikigai_secret::space(backend)";
+const DEFAULT_SPACE_LABEL: &str = "ikigai_secret::default_space()";
 
 /// The suite for this module: the seeded name bound on both verbs of `urn:secret`
 /// (a fixture per verb, so the intent survives a suite that looks bindings up per
-/// action), NAMES dropped (wave two), and on macOS the two biometric operations
-/// opted out of the invoking checks — see the file docs.
-fn suite() -> Suite {
+/// action), NAMES dropped (wave two), both space constructors declared host-named
+/// (`space` as the instance the kernel walks), and on macOS the two biometric
+/// operations opted out of the invoking checks — see the file docs.
+fn suite(space: Arc<EndpointSpace>) -> Suite {
     let suite = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
         .fixture(Fixture::new(SECRET, Verb::Source).binding("name", NAME))
-        .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME));
+        .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME))
+        .host_named_space(SPACE_LABEL, space)
+        .host_named_space(DEFAULT_SPACE_LABEL, ikigai_secret::default_space());
     #[cfg(target_os = "macos")]
     let suite = suite
         .opt_out(
@@ -235,12 +263,26 @@ fn assert_shape(report: &Report) {
     assert_eq!(opted, expected, "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
+    let spaces: Vec<(&str, &SpaceNaming)> = report
+        .declared
+        .spaces
+        .iter()
+        .map(|s| (s.label.as_str(), &s.naming))
+        .collect();
+    assert_eq!(
+        spaces,
+        [
+            (SPACE_LABEL, &SpaceNaming::HostNamed),
+            (DEFAULT_SPACE_LABEL, &SpaceNaming::HostNamed)
+        ],
+        "both constructors declared, both host-named: {report}"
+    );
 }
 
 #[test]
 fn conforms() {
-    let (kernel, backend, _dir) = fixture();
-    let report = suite().run_blocking(&kernel);
+    let (kernel, space, backend, _dir) = fixture_with_space();
+    let report = suite(space).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -348,8 +390,8 @@ fn reads_are_never_cached() {
         "every read hits the keystore"
     );
 
-    let (kernel, _backend, _dir) = fixture();
-    let report = suite().cacheable(SECRET).run_blocking(&kernel);
+    let (kernel, space, _backend, _dir) = fixture_with_space();
+    let report = suite(space).cacheable(SECRET).run_blocking(&kernel);
     eprintln!("[declared cacheable]\n{report}");
     let findings: Vec<&ikigai_conformance::Finding> = report.findings.iter().collect();
     assert_eq!(findings.len(), 1, "{report}");
