@@ -83,8 +83,9 @@ a live MCP tool name; it is renamed in the coordinated wave-two pass, not here.
 
 **Passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)**
 (`tests/conformance.rs`): the suite walks the three endpoints over the file keystore in a
-scratch directory, and the test pins by hand what the suite cannot see — a read is
-`Expiry::Always` (and DECLARING it cacheable is a red test), an ungranted caller is refused
+scratch directory with `urn:secret` declared live (`Suite::live`), so a secret read that
+turns cacheable is a red test. The test pins by hand what the suite cannot see — every read
+reaches the keystore, under a narrow grant as under root, an ungranted caller is refused
 identically for a present and an absent secret with the keystore never consulted, the
 manifold (`describe()`, catalog, actions, `Meta`) carries no secret value, and every
 required input is required (the suite's `REQUIRED` check, held on the Sink too with

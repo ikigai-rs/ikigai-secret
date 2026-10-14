@@ -13,12 +13,15 @@
 //!
 //! ## Declarations, and why each
 //!
-//! - Nothing is `pure` and nothing is `cacheable`: a secret read must NEVER be
-//!   cacheable (a cached secret is a secret with no thread and no expiry), so every
-//!   read is `Expiry::Always` and the cache probe has nothing to hold it to. The
-//!   suite has no spelling for "live by design" (conformance PENDING #22), so
-//!   [`reads_are_never_cached`] pins it by hand — and walks once more with
-//!   `cacheable("urn:secret")` declared, asserting the finding that draws.
+//! - `urn:secret` is declared **live** (`Suite::live`), nothing is `pure` and nothing
+//!   is `cacheable`: a secret read must NEVER be cacheable (a cached secret is a secret
+//!   with no thread and no expiry), so every read is `Expiry::Always`. Without the
+//!   declaration the cache probe is silent on an `Always` result and equally silent on
+//!   a read that BECAME cacheable (a `.cacheable()` added to the Source walked clean);
+//!   with it, a cacheable secret read is a `CACHEABLE` finding in [`conforms`]. The
+//!   declaration applies to the Source only (the Sink is mutating, so `CACHEABLE` does
+//!   not run there). [`reads_are_never_cached`] keeps what the probe's one resolution
+//!   under root cannot see: a narrow grant, and every read reaching the keystore.
 //! - `NAMES` is skipped suite-wide, not opted out per id: the id `urn:secret` is a
 //!   live MCP tool name (`urn_secret__source`), renamed in one coordinated pass
 //!   (wave two, owned by `ikigai-core-PENDING.md` §1). `Suite::opt_out` cannot
@@ -216,13 +219,15 @@ const DEFAULT_SPACE_LABEL: &str = "ikigai_secret::default_space()";
 
 /// The suite for this module: the seeded name bound on both verbs of `urn:secret`
 /// (a fixture per verb, so the intent survives a suite that looks bindings up per
-/// action), NAMES dropped (wave two), REQUIRED held on the Sink too, both space
+/// action), `urn:secret` declared live, NAMES dropped (wave two), REQUIRED held on
+/// the Sink too, both space
 /// constructors declared host-named (`space` as the instance the kernel walks), and
 /// on macOS the two biometric operations opted out of the invoking checks — see the
 /// file docs.
 fn suite(space: Arc<EndpointSpace>) -> Suite {
     let suite = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
+        .live(SECRET)
         .required_on_mutating()
         .fixture(Fixture::new(SECRET, Verb::Source).binding("name", NAME))
         .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME))
@@ -274,6 +279,8 @@ fn assert_shape(report: &Report) {
     };
     assert_eq!(opted, expected, "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
+    assert!(report.declared.cacheable.is_empty(), "{report}");
+    assert_eq!(report.declared.live, [SECRET], "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
     assert!(report.declared.required_on_mutating, "{report}");
     let spaces: Vec<(&str, &SpaceNaming)> = report
@@ -300,7 +307,6 @@ fn conforms() {
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
-    assert!(report.declared.cacheable.is_empty(), "{report}");
 
     // The walk's footprint on the keystore, exactly: the cache probe read the
     // seeded secret once (`Always` needs no second resolution), the pipeline
@@ -380,10 +386,8 @@ fn secret_iri(name: &str) -> String {
 }
 
 /// A secret read is `Expiry::Always` — never cached, under the exact grant and
-/// under root alike — and DECLARING it cacheable draws exactly one finding, on
-/// the Source of `urn:secret`, naming the declaration. That finding is the only
-/// way a future `.cacheable()` on a secret becomes visible: the types are
-/// identical either way.
+/// under root alike — and every read reaches the keystore. The suite's `live`
+/// declaration holds the expiry (one resolution, under root); this holds the rest.
 #[test]
 fn reads_are_never_cached() {
     let (kernel, backend, _dir) = fixture();
@@ -403,21 +407,6 @@ fn reads_are_never_cached() {
         [Op::Get(NAME.into()), Op::Get(NAME.into())],
         "every read hits the keystore"
     );
-
-    let (kernel, space, _backend, _dir) = fixture_with_space();
-    let report = suite(space).cacheable(SECRET).run_blocking(&kernel);
-    eprintln!("[declared cacheable]\n{report}");
-    let findings: Vec<&ikigai_conformance::Finding> = report.findings.iter().collect();
-    assert_eq!(findings.len(), 1, "{report}");
-    let finding = findings[0];
-    assert_eq!(finding.check, Check::Cacheable, "{report}");
-    assert_eq!(finding.endpoint, SECRET, "{report}");
-    assert_eq!(finding.verb, Some(Verb::Source), "{report}");
-    assert!(
-        finding.detail.contains("declared cacheable"),
-        "the finding names the declaration: {finding}"
-    );
-    assert_eq!(report.declared.cacheable, [SECRET], "{report}");
 }
 
 /// Denied before Exists. Under no grants and under a grant on ANOTHER name, a
