@@ -33,6 +33,16 @@
 //!   matters, and [`ungranted_callers_are_refused_before_the_keystore_is_touched`]
 //!   pins it on every platform. Off macOS the prompt is a no-op and both are
 //!   walked: the ubuntu CI job covers what the macOS job cannot.
+//! - `Suite::required_on_mutating()` (conformance 0.8, `REQUIRED`). By default the
+//!   check drops required inputs from `Source`/`Exists` only, and here that is
+//!   VACUOUS on macOS: the `urn:secret` Source's one required input is the `{name}`
+//!   binding (not by value), unlock takes none, and generate (`into`) is opted out
+//!   above. Declaring it holds the Sink too: `content` is dropped from the pipeline
+//!   probe's firing and must be a typed `MissingArgument`. The kernel is the scratch
+//!   file store, so a wrongly accepted drop could only write there, and the endpoint
+//!   refuses before the keystore is consulted (the footprint in [`conforms`] is
+//!   unchanged). A clean report proves the declaration reached a Sink: an unreached
+//!   one is a `DECLARATIONS` finding. Off macOS the walk also drops generate's `into`.
 //!
 //! - Both space constructors are declared **host-named** (`SPACE-NAME`, ledger #987):
 //!   [`ikigai_secret::space`] is parameterized by the backend it is handed, and
@@ -206,12 +216,14 @@ const DEFAULT_SPACE_LABEL: &str = "ikigai_secret::default_space()";
 
 /// The suite for this module: the seeded name bound on both verbs of `urn:secret`
 /// (a fixture per verb, so the intent survives a suite that looks bindings up per
-/// action), NAMES dropped (wave two), both space constructors declared host-named
-/// (`space` as the instance the kernel walks), and on macOS the two biometric
-/// operations opted out of the invoking checks — see the file docs.
+/// action), NAMES dropped (wave two), REQUIRED held on the Sink too, both space
+/// constructors declared host-named (`space` as the instance the kernel walks), and
+/// on macOS the two biometric operations opted out of the invoking checks — see the
+/// file docs.
 fn suite(space: Arc<EndpointSpace>) -> Suite {
     let suite = Suite::new()
         .checks(Checks::all() - Checks::NAMES)
+        .required_on_mutating()
         .fixture(Fixture::new(SECRET, Verb::Source).binding("name", NAME))
         .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME))
         .host_named_space(SPACE_LABEL, space)
@@ -263,6 +275,7 @@ fn assert_shape(report: &Report) {
     assert_eq!(opted, expected, "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
     assert!(report.declared.namespaces.is_empty(), "{report}");
+    assert!(report.declared.required_on_mutating, "{report}");
     let spaces: Vec<(&str, &SpaceNaming)> = report
         .declared
         .spaces
@@ -293,6 +306,7 @@ fn conforms() {
     // seeded secret once (`Always` needs no second resolution), the pipeline
     // probe fired the Sink once (one `replace`: the file store's is atomic, never a
     // delete then a set), and ENFORCED — under no grants — never reached the store.
+    // REQUIRED's Sink without `content` was refused before the store too.
     assert_eq!(
         backend.ops_on(NAME),
         [Op::Get(NAME.into()), Op::Replace(NAME.into())],
@@ -526,7 +540,10 @@ fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
 /// PENDING #49: a required input dropped from an otherwise valid call is a
 /// `MissingArgument` naming it — `content` on the Sink, `into` on generate — and
 /// the keystore is untouched. Generate reads `into` BEFORE its biometric gate,
-/// so this holds on macOS with no prompt.
+/// so this holds on macOS with no prompt. Since conformance 0.8 the suite's
+/// REQUIRED check sees the typed refusal for the Sink on every platform and for
+/// generate off macOS; this test still owns generate on macOS (opted out of the
+/// walk), the NAME of the missing argument, and the untouched keystore.
 #[test]
 fn required_inputs_are_required() {
     let (kernel, backend, _dir) = fixture();
