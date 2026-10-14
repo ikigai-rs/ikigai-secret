@@ -87,7 +87,8 @@ scratch directory, and the test pins by hand what the suite cannot see — a rea
 `Expiry::Always` (and DECLARING it cacheable is a red test), an ungranted caller is refused
 identically for a present and an absent secret with the keystore never consulted, the
 manifold (`describe()`, catalog, actions, `Meta`) carries no secret value, and every
-required input is required. On macOS the two biometric operations are opted out of the
+required input is required (the suite's `REQUIRED` check, held on the Sink too with
+`Suite::required_on_mutating`, plus a hand test for what the walk skips). On macOS the two biometric operations are opted out of the
 invoking checks — past their capability gate is a real Touch ID prompt — and the ubuntu job
 walks them; the gate before the prompt is pinned on both.
 
