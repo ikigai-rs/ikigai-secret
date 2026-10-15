@@ -24,13 +24,14 @@ never inlined, never cached.
 - **Exists and Delete** on `urn:secret:{name}`: `Exists` answers `true` or `false` under
   the read scope `urn:cap:secret:read:<name>` (a reader learns as much from a `Source`), and
   `Delete` removes the secret under its OWN scope, `urn:cap:secret:delete:<name>`, so a
-  write grant issued before `Delete` existed does not gain deletion. `Delete` is idempotent,
-  and neither answer is ever cached.
+  write grant issued before `Delete` existed does not gain deletion. `Delete` then **asks for
+  presence** (Touch ID on a Mac), after every capability and argument check, and deletes
+  nothing when presence is refused. `Delete` is idempotent, and neither answer is ever cached.
 - A **presence gate**: the `PresenceGate` trait, which `urn:secret:unlock`
-  (`urn:cap:secret:unlock`) and `urn:secret:generate` ask only after every capability and
-  argument check. `space(backend)` uses `BiometricGate` (`require_biometric`: macOS Touch ID,
+  (`urn:cap:secret:unlock`), `urn:secret:generate` and a `Delete` on `urn:secret:{name}` ask
+  only after every capability and argument check. `space(backend)` uses `BiometricGate` (`require_biometric`: macOS Touch ID,
   a no-op elsewhere); `space_with_gate(backend, gate)` injects another, and any
-  `Fn(&str) -> Result<()>` closure is one, so a test stubs it and both operations run
+  `Fn(&str) -> Result<()>` closure is one, so a test stubs it and every gated operation runs
   headless on every platform.
 - **Key generation** — the reserved op **`urn:secret:generate`** (`into=<keyname>`,
   `type=ed25519`|`age`) mints a keypair — an **Ed25519** *signing* key (PKCS8/SPKI PEM, read
@@ -85,7 +86,7 @@ each operation only to a holder of its scope.
 | `urn:secret:{name}` | `urn:secret` | Source | `urn:cap:secret:read:*` (the exact name at invoke) |
 | `urn:secret:{name}` | `urn:secret` | Sink | `urn:cap:secret:write:*` (the exact name at invoke) |
 | `urn:secret:{name}` | `urn:secret` | Exists | `urn:cap:secret:read:*` (the exact name at invoke) |
-| `urn:secret:{name}` | `urn:secret` | Delete | `urn:cap:secret:delete:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `urn:secret` | Delete | `urn:cap:secret:delete:*` (the exact name at invoke), then presence |
 
 The two reserved operations are bound EXACTLY, ahead of the template, so a secret can never
 be stored under either name. The id `urn:secret` predates the kebab-case convention and is
@@ -103,8 +104,8 @@ required input is required (the suite's `REQUIRED` check, held on the Sink too w
 out: the fixture injects a stub presence gate that logs each request beside the keystore
 calls, so the two gated operations are walked on macOS too (their real gate is a Touch ID
 prompt), and the test pins that the gate is asked only after every other check and that its
-refusal stands. The `Delete` declares no `content`, so the suite fires it only under no
-grants: the walk deletes nothing.
+refusal stands, for unlock, generate and a `Delete`. The `Delete` declares no `content`, so the
+suite fires it only under no grants: the walk deletes nothing and never reaches the gate.
 
 ## The file store
 
@@ -156,6 +157,11 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   `Delete`, and nothing a host already granted gains it. Tested over the file store; over the
   Keychain both run the backend's existing `exists` (a read of the item) and `delete`, which
   no test reaches (TCC).
+- **`Delete` asks for presence** (ledger #1525, Brian 2026-10-14): like unlock and generate, a
+  `Delete` on `urn:secret:{name}` asks the presence gate after every capability and argument
+  check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
+  is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
+  `space_with_gate`. A refused-by-capability delete never asks.
 
 ## 0.1.7 (2026-10-07)
 

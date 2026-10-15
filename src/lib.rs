@@ -10,7 +10,8 @@
 //!   [`space`] uses [`BiometricGate`], which is [`require_biometric`] (macOS Touch ID via
 //!   `LAContext`, a no-op elsewhere). The resource `urn:secret:unlock` proves presence, so a
 //!   host can require a person at the machine for a sensitive operation (e.g. enrolling a
-//!   passkey); a test injects a stub, so both gated operations run headless on every platform.
+//!   passkey), and `urn:secret:generate` and a `Delete` of a stored secret ask it too; a test
+//!   injects a stub, so every gated operation runs headless on every platform.
 //! - **Key generation**: the reserved operation `urn:secret:generate` (`into=<keyname>`,
 //!   `type=ed25519`|`age`) mints a keypair — an **Ed25519** signing key (PKCS8/SPKI PEM,
 //!   read by `ikigai-sign`) or an **`age`** X25519 encryption key (identity/recipient, read
@@ -29,7 +30,8 @@
 //! `Exists` answers `true` or `false` under the read scope (a reader learns that much from a
 //! `Source` anyway), and `Delete` removes the secret under its own scope,
 //! `urn:cap:secret:delete:<name>`: a write grant does not delete, so no grant issued before
-//! `Delete` existed gains it.
+//! `Delete` existed gains it. A `Delete` then asks the presence gate, after every capability and
+//! argument check, and deletes nothing when presence is refused.
 //!
 //! Scopes (default-deny): `urn:cap:secret:read:<name>` (Source, Exists),
 //! `urn:cap:secret:write:<name>` (Sink), `urn:cap:secret:delete:<name>` (Delete),
@@ -260,8 +262,8 @@ pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
 /// A space resolves first match, so the exact bindings shadow the template: a secret can
 /// never be stored under either reserved name, and each operation is offered in the
 /// manifold under its own capability (`urn:cap:secret:unlock`, `urn:cap:secret:generate`)
-/// rather than hidden inside the template's. Both consult `gate`, and only once every
-/// capability and argument check has passed.
+/// rather than hidden inside the template's. Both consult `gate`, and so does a `Delete` on
+/// the template, each only once every capability and argument check has passed.
 ///
 /// A host picks the gate; a test stubs it, so the operations past it run headless (on macOS
 /// the platform gate is a real Touch ID prompt):
@@ -305,12 +307,12 @@ pub fn space_with_gate(backend: Arc<dyn Backend>, gate: Arc<dyn PresenceGate>) -
             Exact::new(GENERATE_IRI),
             GenerateEndpoint {
                 backend: Arc::clone(&backend),
-                gate,
+                gate: Arc::clone(&gate),
             },
         )
         .bind(
             UriTemplate::parse("urn:secret:{name}").expect("valid template"),
-            SecretEndpoint { backend },
+            SecretEndpoint { backend, gate },
         )
 }
 
@@ -319,8 +321,9 @@ pub fn default_space() -> EndpointSpace {
     space(default_backend())
 }
 
-/// Proves a person is at the machine before a sensitive operation: what `urn:secret:unlock`
-/// and `urn:secret:generate` consult, injected through [`space_with_gate`].
+/// Proves a person is at the machine before a sensitive operation: what `urn:secret:unlock`,
+/// `urn:secret:generate` and a `Delete` on `urn:secret:{name}` consult, injected through
+/// [`space_with_gate`].
 ///
 /// [`require`](PresenceGate::require) blocks until the person responds: `Ok(())` when presence
 /// is proven, an error (a [`Error::Denied`] by convention) when it is not, which the operation
@@ -459,11 +462,13 @@ fn refuse_deny_shaped(name: &str, arg: &str) -> Result<()> {
 
 /// The stored-secret endpoint: `urn:secret:{name}`, `Source` and `Exists` under
 /// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`, `Delete` under
-/// `urn:cap:secret:delete:<name>`. The capability is checked BEFORE the keystore is
-/// consulted, so an ungranted caller learns nothing — not even whether the name exists — and
-/// the backend is never touched.
+/// `urn:cap:secret:delete:<name>` and then the presence gate. The capability is checked BEFORE
+/// the keystore is consulted (and before the gate), so an ungranted caller learns nothing — not
+/// even whether the name exists — and the backend is never touched.
 struct SecretEndpoint {
     backend: Arc<dyn Backend>,
+    /// Asked by `Delete` alone, last: removing a secret needs a person at the machine.
+    gate: Arc<dyn PresenceGate>,
 }
 
 #[async_trait]
@@ -547,6 +552,11 @@ impl Endpoint for SecretEndpoint {
                         "deleting `{name}` requires `{scope}`"
                     )));
                 }
+                // Then presence, after every capability and argument check (a refused caller
+                // never reaches the gate) and before the keystore: the gate's refusal is the
+                // answer, and nothing is deleted. Asked whether or not the name holds a
+                // secret, so the prompt says nothing about the store.
+                self.gate.require(&format!("Delete secret {name}"))?;
                 self.backend.delete(&name)?;
                 Ok(Representation::new(
                     ReprType::new("text/plain"),
@@ -581,7 +591,8 @@ impl Endpoint for SecretEndpoint {
                  default-deny, refused before the keystore is consulted. A Sink stores the piped \
                  `content`, REPLACING any existing item so the new one is owned by this process (a \
                  keystore item the `security` CLI created re-prompts a code-signed reader; one \
-                 this writes does not). Exists answers `true` or `false`; Delete is idempotent. \
+                 this writes does not). Exists answers `true` or `false`; Delete is idempotent \
+                 and, once its capability passes, biometric-gated (macOS Touch ID). \
                  Never cached: every read hits the keystore. The reserved operations `urn:secret:unlock` and \
                  `urn:secret:generate` are bound ahead of this template as their own endpoints.",
             )
@@ -619,7 +630,10 @@ impl Endpoint for SecretEndpoint {
             )
             .action(
                 ActionSpec::new(Verb::Delete)
-                    .summary("remove a secret (idempotent: an absent one answers the same)")
+                    .summary(
+                        "remove a secret (idempotent: an absent one answers the same); asks for \
+                         presence (macOS Touch ID) after the capability check",
+                    )
                     .requires("urn:cap:secret:delete:*")
                     .input(name())
                     .output("text/plain"),
@@ -1805,6 +1819,45 @@ mod tests {
         let err = Resolver::issue_as(&kernel, req, &Capability::scoped(Vec::<String>::new()))
             .expect_err("unlock without `urn:cap:secret:unlock` is denied");
         assert!(matches!(err, Error::Denied(_)), "typed: {err:?}");
+    }
+
+    #[test]
+    fn delete_is_capability_gated_before_the_presence_gate() {
+        // Every capability check runs before the gate, so each of these is denied without
+        // asking it (the gate panics if asked), and the secret survives.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FileBackend::new(dir.path()));
+        backend.set("api-key", b"sk-123").unwrap();
+        let kernel = ikigai_core::Kernel::new(Arc::new(space_with_gate(
+            backend.clone(),
+            unreachable_gate(),
+        )));
+        let req = || {
+            Request::new(
+                Verb::Delete,
+                ikigai_core::Iri::parse("urn:secret:api-key").unwrap(),
+            )
+        };
+        for scopes in [
+            vec![],
+            vec!["urn:cap:secret:delete:other"],
+            vec![
+                "urn:cap:secret:read:api-key",
+                "urn:cap:secret:write:api-key",
+            ],
+        ] {
+            let err = Resolver::issue_as(&kernel, req(), &Capability::scoped(scopes.clone()))
+                .expect_err("delete without `urn:cap:secret:delete:api-key` is denied");
+            assert!(
+                matches!(err, Error::Denied(_)),
+                "{scopes:?}: typed: {err:?}"
+            );
+        }
+        assert_eq!(
+            backend.get("api-key").unwrap().as_deref(),
+            Some(&b"sk-123"[..]),
+            "a refused delete deletes nothing"
+        );
     }
 
     fn generate_req(key: &str) -> Request {
