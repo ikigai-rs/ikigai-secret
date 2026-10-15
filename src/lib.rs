@@ -5,10 +5,12 @@
 //!   a dev **file backend** everywhere else — behind a [`Backend`] trait, plus a
 //!   capability-gated **read face** `urn:secret:{name}` (`Source`). Secrets are never
 //!   cached. The trait exposes get/set/delete for a host (e.g. a relying party's
-//!   credential store); write/delete *over the wire* are a later slice.
-//! - A **biometric gate**: [`require_biometric`] (macOS Touch ID via `LAContext`, a
-//!   no-op elsewhere) and the resource `urn:secret:unlock`, so a host can require
-//!   physical presence for a sensitive operation (e.g. enrolling a passkey).
+//!   credential store); the resource adds `Sink`, `Exists` and `Delete` (below).
+//! - A **presence gate**: the [`PresenceGate`] trait, injected through [`space_with_gate`];
+//!   [`space`] uses [`BiometricGate`], which is [`require_biometric`] (macOS Touch ID via
+//!   `LAContext`, a no-op elsewhere). The resource `urn:secret:unlock` proves presence, so a
+//!   host can require a person at the machine for a sensitive operation (e.g. enrolling a
+//!   passkey); a test injects a stub, so both gated operations run headless on every platform.
 //! - **Key generation**: the reserved operation `urn:secret:generate` (`into=<keyname>`,
 //!   `type=ed25519`|`age`) mints a keypair — an **Ed25519** signing key (PKCS8/SPKI PEM,
 //!   read by `ikigai-sign`) or an **`age`** X25519 encryption key (identity/recipient, read
@@ -24,11 +26,16 @@
 //! [`Backend::replace`]. On the Keychain the new item is owned by this process: a keystore item
 //! the `security` CLI created re-prompts a code-signed reader on every access; one this face
 //! writes does not, because the ACL is this process's. On the file store the replace is atomic.
+//! `Exists` answers `true` or `false` under the read scope (a reader learns that much from a
+//! `Source` anyway), and `Delete` removes the secret under its own scope,
+//! `urn:cap:secret:delete:<name>`: a write grant does not delete, so no grant issued before
+//! `Delete` existed gains it.
 //!
-//! Scopes (default-deny): `urn:cap:secret:read:<name>`, `urn:cap:secret:write:<name>`,
+//! Scopes (default-deny): `urn:cap:secret:read:<name>` (Source, Exists),
+//! `urn:cap:secret:write:<name>` (Sink), `urn:cap:secret:delete:<name>` (Delete),
 //! `urn:cap:secret:unlock`, `urn:cap:secret:generate` (with the write scopes of what it
-//! writes). Each is DECLARED on its action (the per-name pair as the wildcards
-//! `urn:cap:secret:read:*` / `urn:cap:secret:write:*`),
+//! writes). Each is DECLARED on its action (the per-name scopes as the wildcards
+//! `urn:cap:secret:read:*`, `urn:cap:secret:write:*` and `urn:cap:secret:delete:*`),
 //! so the kernel enforces the floor before an endpoint runs and the manifold offers each
 //! operation only to a holder of its scope. The reserved operations are bound as their own
 //! endpoints ahead of the `{name}` template (see [`space`]). A refused call never reaches
@@ -240,21 +247,65 @@ pub fn default_backend() -> Arc<dyn Backend> {
     }
 }
 
-/// The `urn:secret:*` space over `backend`. Mount it in a host kernel.
+/// The `urn:secret:*` space over `backend`, gated by the platform's [`BiometricGate`]. Mount
+/// it in a host kernel. [`space_with_gate`] is the same space with the gate injected.
+pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
+    space_with_gate(backend, Arc::new(BiometricGate))
+}
+
+/// The `urn:secret:*` space over `backend`, proving presence through `gate`.
 ///
 /// Three entries, in this order: the reserved operations [`UNLOCK_IRI`] and
 /// [`GENERATE_IRI`] bound EXACTLY, then the stored-secret template `urn:secret:{name}`.
 /// A space resolves first match, so the exact bindings shadow the template: a secret can
 /// never be stored under either reserved name, and each operation is offered in the
 /// manifold under its own capability (`urn:cap:secret:unlock`, `urn:cap:secret:generate`)
-/// rather than hidden inside the template's.
-pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
+/// rather than hidden inside the template's. Both consult `gate`, and only once every
+/// capability and argument check has passed.
+///
+/// A host picks the gate; a test stubs it, so the operations past it run headless (on macOS
+/// the platform gate is a real Touch ID prompt):
+///
+/// ```
+/// use std::sync::Arc;
+/// use ikigai_core::{Capability, Error, Iri, Kernel, Request, Verb};
+/// use ikigai_secret::{space_with_gate, FileBackend, UNLOCK_IRI};
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let unlock = |kernel: &Kernel| {
+///     let request = Request::new(Verb::Source, Iri::parse(UNLOCK_IRI).unwrap());
+///     futures::executor::block_on(kernel.issue(request, &Capability::root()))
+/// };
+///
+/// // A gate that finds nobody at the machine: unlock is refused with its answer.
+/// let nobody = |_reason: &str| Err(Error::Denied("nobody at the machine".into()));
+/// let kernel = Kernel::new(Arc::new(space_with_gate(
+///     Arc::new(FileBackend::new(dir.path())),
+///     Arc::new(nobody),
+/// )));
+/// assert!(matches!(unlock(&kernel), Err(Error::Denied(why)) if why == "nobody at the machine"));
+///
+/// // A gate that finds someone: unlocked.
+/// let present = |_reason: &str| Ok(());
+/// let kernel = Kernel::new(Arc::new(space_with_gate(
+///     Arc::new(FileBackend::new(dir.path())),
+///     Arc::new(present),
+/// )));
+/// assert_eq!(unlock(&kernel).unwrap().bytes, b"unlocked");
+/// ```
+pub fn space_with_gate(backend: Arc<dyn Backend>, gate: Arc<dyn PresenceGate>) -> EndpointSpace {
     EndpointSpace::new()
-        .bind(Exact::new(UNLOCK_IRI), UnlockEndpoint)
+        .bind(
+            Exact::new(UNLOCK_IRI),
+            UnlockEndpoint {
+                gate: Arc::clone(&gate),
+            },
+        )
         .bind(
             Exact::new(GENERATE_IRI),
             GenerateEndpoint {
                 backend: Arc::clone(&backend),
+                gate,
             },
         )
         .bind(
@@ -266,6 +317,39 @@ pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
 /// [`space`] over [`default_backend`].
 pub fn default_space() -> EndpointSpace {
     space(default_backend())
+}
+
+/// Proves a person is at the machine before a sensitive operation: what `urn:secret:unlock`
+/// and `urn:secret:generate` consult, injected through [`space_with_gate`].
+///
+/// [`require`](PresenceGate::require) blocks until the person responds: `Ok(())` when presence
+/// is proven, an error (a [`Error::Denied`] by convention) when it is not, which the operation
+/// returns unchanged. The operations ask only after every capability and argument check has
+/// passed, so a refused caller never reaches the gate. Any `Fn(&str) -> Result<()>` closure
+/// is a gate, so a test's stub is one line.
+pub trait PresenceGate: Send + Sync {
+    /// Require presence, showing `reason` to the person asked.
+    fn require(&self, reason: &str) -> Result<()>;
+}
+
+impl<F> PresenceGate for F
+where
+    F: Fn(&str) -> Result<()> + Send + Sync,
+{
+    fn require(&self, reason: &str) -> Result<()> {
+        self(reason)
+    }
+}
+
+/// The platform's presence gate, [`require_biometric`]: Touch ID on macOS, a no-op elsewhere.
+/// What [`space`] and [`default_space`] use.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BiometricGate;
+
+impl PresenceGate for BiometricGate {
+    fn require(&self, reason: &str) -> Result<()> {
+        require_biometric(reason)
+    }
 }
 
 /// Require biometric presence (Touch ID) for a sensitive operation, showing `reason` in
@@ -373,10 +457,11 @@ fn refuse_deny_shaped(name: &str, arg: &str) -> Result<()> {
     Ok(())
 }
 
-/// The stored-secret endpoint: `urn:secret:{name}`, `Source` under
-/// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`. The
-/// capability is checked BEFORE the keystore is consulted, so an ungranted caller learns
-/// nothing — not even whether the name exists — and the backend is never touched.
+/// The stored-secret endpoint: `urn:secret:{name}`, `Source` and `Exists` under
+/// `urn:cap:secret:read:<name>`, `Sink` under `urn:cap:secret:write:<name>`, `Delete` under
+/// `urn:cap:secret:delete:<name>`. The capability is checked BEFORE the keystore is
+/// consulted, so an ungranted caller learns nothing — not even whether the name exists — and
+/// the backend is never touched.
 struct SecretEndpoint {
     backend: Arc<dyn Backend>,
 }
@@ -435,8 +520,41 @@ impl Endpoint for SecretEndpoint {
                     b"stored".to_vec(),
                 ))
             }
+            // Whether the secret is stored. The read scope, not a scope of its own: a reader
+            // learns as much from a `Source` (bytes or `NotFound`), so nothing new is
+            // disclosed, and nothing is read that the answer does not need.
+            Verb::Exists => {
+                let scope = format!("urn:cap:secret:read:{name}");
+                if !inv.capability.allows(&scope) {
+                    return Err(Error::Denied(format!(
+                        "asking whether `{name}` exists requires `{scope}`"
+                    )));
+                }
+                let present = self.backend.exists(&name)?;
+                // Never cacheable, like the read: whether a secret exists is live.
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    if present { "true" } else { "false" }.as_bytes().to_vec(),
+                ))
+            }
+            // Remove the secret. Its own scope, not the write scope: a host that granted
+            // `write` before `Delete` existed did not grant deletion, and still has not.
+            // Idempotent, as the store's `delete` is: an absent secret answers the same.
+            Verb::Delete => {
+                let scope = format!("urn:cap:secret:delete:{name}");
+                if !inv.capability.allows(&scope) {
+                    return Err(Error::Denied(format!(
+                        "deleting `{name}` requires `{scope}`"
+                    )));
+                }
+                self.backend.delete(&name)?;
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"deleted".to_vec(),
+                ))
+            }
             other => Err(Error::Endpoint(format!(
-                "urn:secret does not support {other:?} yet"
+                "urn:secret does not support {other:?}"
             ))),
         }
     }
@@ -456,13 +574,15 @@ impl Endpoint for SecretEndpoint {
         };
         Description::new("urn:secret")
             .summary(
-                "Read (Source) or store (Sink) a named secret in the OS keystore (macOS Keychain; \
-                 a file store elsewhere), capability-gated PER NAME: `urn:cap:secret:read:<name>` \
-                 / `urn:cap:secret:write:<name>`, default-deny, refused before the keystore is \
-                 consulted. A Sink stores the piped `content`, REPLACING any existing item so the \
-                 new one is owned by this process (a keystore item the `security` CLI created \
-                 re-prompts a code-signed reader; one this writes does not). Never cached: every \
-                 read hits the keystore. The reserved operations `urn:secret:unlock` and \
+                "Read (Source), store (Sink), test for (Exists) or remove (Delete) a named secret \
+                 in the OS keystore (macOS Keychain; a file store elsewhere), capability-gated PER \
+                 NAME: `urn:cap:secret:read:<name>` (Source, Exists) / \
+                 `urn:cap:secret:write:<name>` (Sink) / `urn:cap:secret:delete:<name>` (Delete), \
+                 default-deny, refused before the keystore is consulted. A Sink stores the piped \
+                 `content`, REPLACING any existing item so the new one is owned by this process (a \
+                 keystore item the `security` CLI created re-prompts a code-signed reader; one \
+                 this writes does not). Exists answers `true` or `false`; Delete is idempotent. \
+                 Never cached: every read hits the keystore. The reserved operations `urn:secret:unlock` and \
                  `urn:secret:generate` are bound ahead of this template as their own endpoints.",
             )
             .input(name())
@@ -490,12 +610,28 @@ impl Endpoint for SecretEndpoint {
                     )
                     .output("text/plain"),
             )
+            .action(
+                ActionSpec::new(Verb::Exists)
+                    .summary("whether a secret is stored: `true` or `false` (a read)")
+                    .requires("urn:cap:secret:read:*")
+                    .input(name())
+                    .output("text/plain"),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .summary("remove a secret (idempotent: an absent one answers the same)")
+                    .requires("urn:cap:secret:delete:*")
+                    .input(name())
+                    .output("text/plain"),
+            )
     }
 }
 
-/// `urn:secret:unlock` — prove biometric presence (Touch ID), capability-gated by
-/// `urn:cap:secret:unlock`. A reserved operation, not a stored secret.
-struct UnlockEndpoint;
+/// `urn:secret:unlock` — prove presence through the [`PresenceGate`] (Touch ID by default),
+/// capability-gated by `urn:cap:secret:unlock`. A reserved operation, not a stored secret.
+struct UnlockEndpoint {
+    gate: Arc<dyn PresenceGate>,
+}
 
 #[async_trait]
 impl Endpoint for UnlockEndpoint {
@@ -508,7 +644,7 @@ impl Endpoint for UnlockEndpoint {
                 "unlock requires `urn:cap:secret:unlock`".into(),
             ));
         }
-        require_biometric("Unlock ikigai secrets")?;
+        self.gate.require("Unlock ikigai secrets")?;
         Ok(Representation::new(
             ReprType::new("text/plain"),
             b"unlocked".to_vec(),
@@ -533,10 +669,12 @@ impl Endpoint for UnlockEndpoint {
 }
 
 /// `urn:secret:generate` — mint a keypair into the keystore, capability-gated by
-/// `urn:cap:secret:generate` and then biometric-gated. A reserved operation, not a stored
-/// secret: the key name arrives as the by-value argument `into=<keyname>`.
+/// `urn:cap:secret:generate` and then presence-gated (the [`PresenceGate`]). A reserved
+/// operation, not a stored secret: the key name arrives as the by-value argument
+/// `into=<keyname>`.
 struct GenerateEndpoint {
     backend: Arc<dyn Backend>,
+    gate: Arc<dyn PresenceGate>,
 }
 
 impl GenerateEndpoint {
@@ -640,13 +778,14 @@ impl Endpoint for GenerateEndpoint {
         // Not cacheable (mutating + fresh randomness): the default, nothing to opt into.
         let (private, public_half, media_type) = if kind == "ed25519" {
             // `ed25519` — the SIGNING keypair (PKCS8/SPKI PEM), read by ikigai-sign.
-            require_biometric(&format!("Generate signing key {key}"))?;
+            self.gate.require(&format!("Generate signing key {key}"))?;
             let (pkcs8_pem, spki_pem) = generate_ed25519()?;
             (pkcs8_pem, spki_pem, "application/x-pem-file")
         } else {
             // `age` — the ENCRYPTION keypair (X25519 identity/recipient), read by
             // ikigai-encrypt. The dual of the signing key: one identity, two keys.
-            require_biometric(&format!("Generate encryption key {key}"))?;
+            self.gate
+                .require(&format!("Generate encryption key {key}"))?;
             let (identity, recipient) = generate_age();
             (identity, recipient, "text/plain")
         };
@@ -1640,13 +1779,25 @@ mod tests {
         );
     }
 
+    /// A presence gate that is never to be reached: a refused caller must not get as far as
+    /// asking for presence.
+    fn unreachable_gate() -> Arc<dyn PresenceGate> {
+        Arc::new(|reason: &str| -> Result<()> { panic!("the presence gate was asked: {reason}") })
+    }
+
+    /// A presence gate that always finds someone at the machine.
+    fn present() -> Arc<dyn PresenceGate> {
+        Arc::new(|_: &str| Ok(()))
+    }
+
     #[test]
-    fn unlock_is_capability_gated_before_the_biometric_prompt() {
-        // The cap check runs before `require_biometric`, so this is denied without a
-        // prompt (a granted unlock would prompt for Touch ID — not testable in CI).
+    fn unlock_is_capability_gated_before_the_presence_gate() {
+        // The cap check runs before the gate, so this is denied without asking it.
         let dir = tempfile::tempdir().unwrap();
-        let kernel =
-            ikigai_core::Kernel::new(Arc::new(space(Arc::new(FileBackend::new(dir.path())))));
+        let kernel = ikigai_core::Kernel::new(Arc::new(space_with_gate(
+            Arc::new(FileBackend::new(dir.path())),
+            unreachable_gate(),
+        )));
         let req = Request::new(
             Verb::Source,
             ikigai_core::Iri::parse("urn:secret:unlock").unwrap(),
@@ -1665,9 +1816,8 @@ mod tests {
     }
 
     // Keygen itself is cross-platform and gate-free — unit-test it directly, so the
-    // "the pair matches" guarantee holds headless everywhere. The endpoint's biometric
-    // gate is a REAL Touch ID prompt on macOS (only a no-op off it), so the granted
-    // endpoint path is exercised on non-macOS below and validated on Brian's Mac by hand.
+    // "the pair matches" guarantee holds headless everywhere. The endpoint's path past its
+    // presence gate is exercised below with the gate stubbed, on every platform.
     #[test]
     fn generate_age_produces_a_matching_x25519_pair() {
         use std::str::FromStr;
@@ -1721,10 +1871,13 @@ mod tests {
     fn generate_without_the_cap_is_denied_and_stores_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FileBackend::new(dir.path()));
-        let kernel = ikigai_core::Kernel::new(Arc::new(space(backend.clone())));
+        let kernel = ikigai_core::Kernel::new(Arc::new(space_with_gate(
+            backend.clone(),
+            unreachable_gate(),
+        )));
 
-        // No cap → denied. The cap check runs before keygen/biometric, so this is denied
-        // WITHOUT any Touch ID prompt (holds on macOS too).
+        // No cap → denied. The cap check runs before keygen and the presence gate, so this
+        // is denied WITHOUT asking the gate.
         let err = Resolver::issue_as(
             &kernel,
             generate_req("nope"),
@@ -1773,11 +1926,9 @@ mod tests {
         );
     }
 
-    // The full granted endpoint path — cap → biometric (no-op off macOS) → store both
-    // keys → return the SPKI-PEM public key. macOS-gated OUT because there the biometric
-    // gate is a real Touch ID prompt (validated by hand on Brian's Mac); runs in the
-    // ubuntu CI job, which mirrors the module's existing cfg split.
-    #[cfg(not(target_os = "macos"))]
+    // The full granted endpoint path — cap → presence gate (stubbed) → store both keys →
+    // return the SPKI-PEM public key. On every platform: the gate is injected, so the real
+    // Touch ID prompt is never reached.
     #[test]
     fn generate_endpoint_stores_the_pair_and_returns_the_public_key() {
         use ed25519_dalek::pkcs8::spki::DecodePublicKey;
@@ -1786,7 +1937,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FileBackend::new(dir.path()));
-        let kernel = ikigai_core::Kernel::new(Arc::new(space(backend.clone())));
+        let kernel =
+            ikigai_core::Kernel::new(Arc::new(space_with_gate(backend.clone(), present())));
 
         let (repr, _) = Resolver::issue_as(
             &kernel,
@@ -2003,10 +2155,8 @@ mod tests {
     }
 
     /// A store whose `.pub` writes fail: the private half must not be left behind.
-    #[cfg(not(target_os = "macos"))]
     struct PublicHalfFails(FileBackend);
 
-    #[cfg(not(target_os = "macos"))]
     impl Backend for PublicHalfFails {
         fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
             self.0.get(name)
@@ -2022,12 +2172,12 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn generate_never_leaves_half_a_pair() {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(PublicHalfFails(FileBackend::new(dir.path())));
-        let kernel = ikigai_core::Kernel::new(Arc::new(space(backend.clone())));
+        let kernel =
+            ikigai_core::Kernel::new(Arc::new(space_with_gate(backend.clone(), present())));
         let err = Resolver::issue_as(&kernel, generate_req("half"), &Capability::root())
             .expect_err("the public half cannot be written");
         assert!(err.to_string().contains("stored nothing"), "{err}");

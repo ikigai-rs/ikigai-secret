@@ -11,15 +11,16 @@
 //! - **B4a** generate checked only `urn:cap:secret:generate`, then wrote `<into>` and
 //!   `<into>.pub` with no write authority; **B4b** it stored under a reserved name.
 //!
-//! The generate tests run only off macOS, where the biometric gate is a no-op (on a Mac it is
-//! a real Touch ID prompt). CI's ubuntu job runs them natively; on a Mac they run under WASI:
-//! build with `cargo test --target wasm32-wasip1 --test audit_854 --no-run` and run the
-//! `.wasm` under Node's WASI with a preopened directory passed as `SCRATCH_DIR` (tempfile's
-//! `/tmp` is not reachable there, which is the only reason [`scratch`] reads it).
+//! The generate tests run on every platform: [`kernel_over`] injects a stub presence gate
+//! (ledger #201), so the real Touch ID prompt a Mac would show is never reached. They used to
+//! run only off macOS, and on a Mac under WASI; that path still works (build with
+//! `cargo test --target wasm32-wasip1 --test audit_854 --no-run` and run the `.wasm` under
+//! Node's WASI with a preopened directory passed as `SCRATCH_DIR`; tempfile's `/tmp` is not
+//! reachable there, which is the only reason [`scratch`] reads it).
 
 use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Verb};
 use ikigai_resolve::Resolver;
-use ikigai_secret::{space, Backend, FileBackend};
+use ikigai_secret::{space_with_gate, Backend, FileBackend};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -47,8 +48,11 @@ fn store(tag: &str) -> (PathBuf, Option<tempfile::TempDir>) {
     (dir.join("secrets"), guard)
 }
 
+/// The space over `backend`, its presence gate stubbed to find someone at the machine: on
+/// macOS the platform gate is a real Touch ID prompt, so no test here may reach it.
 fn kernel_over(backend: Arc<dyn Backend>) -> Kernel {
-    Kernel::new(Arc::new(space(backend)))
+    let present = |_: &str| -> ikigai_core::Result<()> { Ok(()) };
+    Kernel::new(Arc::new(space_with_gate(backend, Arc::new(present))))
 }
 
 fn source(name: &str) -> Request {
@@ -484,14 +488,12 @@ fn run_in_child(prelude: &str, test: &str) {
 // B4: generate writes only what its caller may write, and never a reserved name
 // =============================================================================================
 
-#[cfg(not(target_os = "macos"))]
 fn generate(into: &str, kind: &str) -> Request {
     Request::new(Verb::Source, Iri::parse("urn:secret:generate").unwrap())
         .with_arg("into", ArgRef::Inline(into.as_bytes().to_vec()))
         .with_arg("type", ArgRef::Inline(kind.as_bytes().to_vec()))
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn b4_generate_does_not_overwrite_a_secret_the_caller_cannot_write() {
     let (dir, _guard) = store("b4a");
@@ -516,7 +518,6 @@ fn b4_generate_does_not_overwrite_a_secret_the_caller_cannot_write() {
 }
 
 /// Write authority over BOTH halves: `<into>` and `<into>.pub`.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn b4_generate_needs_write_authority_over_both_halves() {
     let (dir, _guard) = store("b4a-halves");
@@ -564,7 +565,6 @@ fn b4_generate_needs_write_authority_over_both_halves() {
 
 /// Generate never overwrites, even under root: either half already present refuses, and
 /// nothing changes. Rotation is a new name.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn b4_generate_refuses_a_name_that_already_holds_a_secret() {
     let (dir, _guard) = store("b4a-exists");
@@ -593,7 +593,6 @@ fn b4_generate_refuses_a_name_that_already_holds_a_secret() {
 }
 
 // README: "a secret can never be stored under either reserved name".
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn b4_generate_never_stores_under_a_reserved_name() {
     let (dir, _guard) = store("b4b");

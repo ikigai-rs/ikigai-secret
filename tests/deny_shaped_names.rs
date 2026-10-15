@@ -15,7 +15,7 @@
 
 use ikigai_core::{ArgRef, Capability, Error, Iri, Kernel, Request, Result, Verb};
 use ikigai_resolve::Resolver;
-use ikigai_secret::{space, Backend, FileBackend};
+use ikigai_secret::{space_with_gate, Backend, FileBackend};
 use std::sync::{Arc, Mutex};
 
 /// A backend that records every call and holds nothing: a refusal must never reach it.
@@ -56,9 +56,12 @@ impl Backend for Recording {
     }
 }
 
+/// The space over `backend`, with a presence gate that must never be asked: every call here is
+/// refused before it (and on macOS the platform gate would be a real Touch ID prompt).
 fn kernel_over(backend: Arc<Recording>) -> Kernel {
     let backend: Arc<dyn Backend> = backend;
-    Kernel::new(Arc::new(space(backend)))
+    let never = |reason: &str| -> Result<()> { panic!("the presence gate was asked: {reason}") };
+    Kernel::new(Arc::new(space_with_gate(backend, Arc::new(never))))
 }
 
 fn scoped(scopes: &[&str]) -> Capability {
@@ -141,6 +144,38 @@ fn the_write_face_refuses_a_name_beginning_with_dash() {
     assert!(backend.calls().is_empty(), "{:?}", backend.calls());
 }
 
+/// Exists and Delete (ledger #202) refuse it too, before their capability check: the refusal
+/// sits ahead of the verb, so a face added later inherits it.
+#[test]
+fn exists_and_delete_refuse_a_name_beginning_with_dash() {
+    let backend = Arc::new(Recording::default());
+    let kernel = kernel_over(backend.clone());
+    let iri = || Iri::parse("urn:secret:-x").unwrap();
+    for (verb, exact, other) in [
+        (
+            Verb::Exists,
+            "urn:cap:secret:read:-x",
+            "urn:cap:secret:read:other",
+        ),
+        (
+            Verb::Delete,
+            "urn:cap:secret:delete:-x",
+            "urn:cap:secret:delete:other",
+        ),
+    ] {
+        for (what, cap) in [
+            ("the exact grant", scoped(&[exact])),
+            ("another name's grant", scoped(&[other])),
+            ("root", Capability::root()),
+        ] {
+            let err = Resolver::issue_as(&kernel, Request::new(verb, iri()), &cap)
+                .expect_err("a name beginning with `-` is refused");
+            assert_refused(&err, "name", &format!("{verb:?} under {what}"));
+        }
+    }
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+}
+
 /// A `-` anywhere but first is just a character: the common case keeps working.
 #[test]
 fn a_dash_inside_a_name_is_still_a_name() {
@@ -157,8 +192,7 @@ fn a_dash_inside_a_name_is_still_a_name() {
 
 /// Generate's `into` is refused before every check that follows it. The capability here holds
 /// `urn:cap:secret:generate` and `write:-k` but NOT `write:-k.pub`, so without the refusal the
-/// call stops at `Denied` before the biometric gate: safe to run on a Mac, where that gate is a
-/// real Touch ID prompt.
+/// call stops at `Denied` before the presence gate.
 #[test]
 fn generate_refuses_into_beginning_with_dash() {
     let backend = Arc::new(Recording::default());
@@ -170,9 +204,8 @@ fn generate_refuses_into_beginning_with_dash() {
     assert!(backend.calls().is_empty(), "{:?}", backend.calls());
 }
 
-/// With every grant (root) the refusal still comes first. Off macOS only: were the refusal
-/// missing, this call would reach the biometric gate, which on a Mac is a real prompt.
-#[cfg(not(target_os = "macos"))]
+/// With every grant (root) the refusal still comes first: were it missing, this call would
+/// reach the presence gate, which here panics.
 #[test]
 fn generate_refuses_into_beginning_with_dash_even_for_root() {
     let backend = Arc::new(Recording::default());

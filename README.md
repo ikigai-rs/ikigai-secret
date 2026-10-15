@@ -21,9 +21,17 @@ never inlined, never cached.
   one this face writes does not); the file store writes the new value whole and renames it
   over the old one, so a failed write keeps the previous secret; the Secure Enclave refuses
   before deleting anything.
-- A **biometric gate**: `require_biometric` (macOS Touch ID, a no-op elsewhere) and the
-  reserved op `urn:secret:unlock` (`urn:cap:secret:unlock`), for operations needing
-  physical presence.
+- **Exists and Delete** on `urn:secret:{name}`: `Exists` answers `true` or `false` under
+  the read scope `urn:cap:secret:read:<name>` (a reader learns as much from a `Source`), and
+  `Delete` removes the secret under its OWN scope, `urn:cap:secret:delete:<name>`, so a
+  write grant issued before `Delete` existed does not gain deletion. `Delete` is idempotent,
+  and neither answer is ever cached.
+- A **presence gate**: the `PresenceGate` trait, which `urn:secret:unlock`
+  (`urn:cap:secret:unlock`) and `urn:secret:generate` ask only after every capability and
+  argument check. `space(backend)` uses `BiometricGate` (`require_biometric`: macOS Touch ID,
+  a no-op elsewhere); `space_with_gate(backend, gate)` injects another, and any
+  `Fn(&str) -> Result<()>` closure is one, so a test stubs it and both operations run
+  headless on every platform.
 - **Key generation** — the reserved op **`urn:secret:generate`** (`into=<keyname>`,
   `type=ed25519`|`age`) mints a keypair — an **Ed25519** *signing* key (PKCS8/SPKI PEM, read
   by [`ikigai-sign`]) or an **`age`** X25519 *encryption* key (identity/recipient, read by
@@ -62,7 +70,7 @@ just a character (`api-key`).
 
 A host uses the `Backend` directly (e.g. a relying party storing credential material
 in the Keychain instead of a plaintext file), or mounts `space()` for cap-scoped reads
-and writes through the kernel.
+and writes through the kernel (`space_with_gate()` to choose the presence gate).
 
 ## The manifold
 
@@ -76,6 +84,8 @@ each operation only to a holder of its scope.
 | `urn:secret:generate` | `secret-generate` | Source | `urn:cap:secret:generate` AND `urn:cap:secret:write:*` (the exact `<into>` and `<into>.pub` at invoke) |
 | `urn:secret:{name}` | `urn:secret` | Source | `urn:cap:secret:read:*` (the exact name at invoke) |
 | `urn:secret:{name}` | `urn:secret` | Sink | `urn:cap:secret:write:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `urn:secret` | Exists | `urn:cap:secret:read:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `urn:secret` | Delete | `urn:cap:secret:delete:*` (the exact name at invoke) |
 
 The two reserved operations are bound EXACTLY, ahead of the template, so a secret can never
 be stored under either name. The id `urn:secret` predates the kebab-case convention and is
@@ -89,9 +99,12 @@ reaches the keystore, under a narrow grant as under root, an ungranted caller is
 identically for a present and an absent secret with the keystore never consulted, the
 manifold (`describe()`, catalog, actions, `Meta`) carries no secret value, and every
 required input is required (the suite's `REQUIRED` check, held on the Sink too with
-`Suite::required_on_mutating`, plus a hand test for what the walk skips). On macOS the two biometric operations are opted out of the
-invoking checks — past their capability gate is a real Touch ID prompt — and the ubuntu job
-walks them; the gate before the prompt is pinned on both.
+`Suite::required_on_mutating`, plus a hand test for what the walk skips). Nothing is opted
+out: the fixture injects a stub presence gate that logs each request beside the keystore
+calls, so the two gated operations are walked on macOS too (their real gate is a Touch ID
+prompt), and the test pins that the gate is asked only after every other check and that its
+refusal stands. The `Delete` declares no `content`, so the suite fires it only under no
+grants: the walk deletes nothing.
 
 ## The file store
 
@@ -130,6 +143,19 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   written it, and a legacy entry differing from a name only in case is refused on a volume
   that folds case. A secret stored under a name outside the verbatim set must be stored
   again.
+
+## Unreleased
+
+- **The presence gate is injectable** (ledger #201): `PresenceGate`, `BiometricGate` and
+  `space_with_gate(backend, gate)`. `space(backend)` is unchanged in behavior (it uses
+  `BiometricGate`), and `require_biometric` stays public. The conformance walk and the
+  generate tests now run on macOS with the gate stubbed; the macOS opt-outs are gone.
+- **`Exists` and `Delete` on `urn:secret:{name}`** (ledger #202), each a per-verb action:
+  `Exists` under `urn:cap:secret:read:*`, `Delete` under the new `urn:cap:secret:delete:*`
+  (the exact name at invoke). A manifold change: a holder of a delete scope is now offered
+  `Delete`, and nothing a host already granted gains it. Tested over the file store; over the
+  Keychain both run the backend's existing `exists` (a read of the item) and `delete`, which
+  no test reaches (TCC).
 
 ## 0.1.7 (2026-10-07)
 
@@ -175,12 +201,14 @@ only verbatim-set names. What changes for a caller:
 
 ## Next slices
 
-- `Exists` / `Delete` over the wire; key rotation / deletion under a capability.
+- Key rotation under a capability.
+- A Keychain `exists` that does not read the item's bytes (today it is the default, a
+  `get`, which a foreign-ACL item answers with a prompt), and a Secure Enclave `exists` that
+  finds the key by label (today it answers `false`, since an Enclave key has no bytes to
+  `get`). Both need the machine to test.
 - An atomic Keychain replace (add under a temporary account, delete the old item, rename the
   new one with `SecItemUpdate`): today a Keychain write that fails after its delete loses the
   previous secret. It needs the Keychain to test, so it is an arc run on the machine.
-- An injectable presence gate, so the biometric operations can be walked headless on the
-  platform they are for (today `require_biometric` is a free function).
 - Secure-Enclave-gated keys for material that must require biometric presence.
 - More backends (Linux Secret Service, HSM/YubiKey, external vaults, passkey) — the facade
   is fixed, the backends plug in.
