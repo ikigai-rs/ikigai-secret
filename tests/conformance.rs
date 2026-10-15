@@ -48,7 +48,8 @@
 //!   unchanged). A clean report proves the declaration reached a Sink: an unreached one is
 //!   a `DECLARATIONS` finding. The Delete takes only the binding, so nothing is dropped.
 //! - `urn:secret`'s `Delete` (ledger #202) declares no `content`, so the suite fires it
-//!   only under no grants (ENFORCED), never under root: the walk deletes nothing.
+//!   only under no grants (ENFORCED), never under root: the walk deletes nothing, and never
+//!   reaches the presence gate a `Delete` asks.
 //!
 //! - The three space constructors are declared **host-named** (`SPACE-NAME`, ledger #987):
 //!   [`ikigai_secret::space_with_gate`] and [`ikigai_secret::space`] are parameterized by the
@@ -78,7 +79,8 @@
 //! - **Exists and Delete** ([`exists_and_delete_answer_under_their_own_scopes`]): the
 //!   answers, the scope each takes (a write grant does not delete), and the keystore calls.
 //! - **The presence gate comes last, and its refusal stands**
-//!   ([`the_presence_gate_is_asked_last_and_its_refusal_stands`]).
+//!   ([`the_presence_gate_is_asked_last_and_its_refusal_stands`],
+//!   [`delete_asks_the_presence_gate_last`]): for unlock, generate and a `Delete`.
 //! - **Required means required** (PENDING #49, [`required_inputs_are_required`]):
 //!   drop `content` from a Sink, `into` from a generate — `MissingArgument`, and
 //!   for generate BEFORE the presence gate.
@@ -832,8 +834,9 @@ fn the_manifold_states_the_contract() {
 
 /// Exists and Delete (ledger #202), each under its own scope. Exists answers `true` or
 /// `false` under the read scope, never cached; Delete removes the secret under
-/// `urn:cap:secret:delete:<name>` and is idempotent; afterward Exists says `false` and a
-/// read is a typed `NotFound`. One keystore call per answer, the scope checked first.
+/// `urn:cap:secret:delete:<name>`, asks the presence gate, and is idempotent; afterward Exists
+/// says `false` and a read is a typed `NotFound`. One keystore call per answer, the scope
+/// checked first.
 #[test]
 fn exists_and_delete_answer_under_their_own_scopes() {
     let (kernel, backend, _dir) = fixture();
@@ -868,20 +871,22 @@ fn exists_and_delete_answer_under_their_own_scopes() {
         [
             Op::Exists(NAME.into()),
             Op::Exists(ABSENT.into()),
+            Op::Presence(format!("Delete secret {NAME}")),
             Op::Delete(NAME.into()),
             Op::Exists(NAME.into()),
             Op::Get(NAME.into()),
+            Op::Presence(format!("Delete secret {NAME}")),
             Op::Delete(NAME.into()),
         ],
-        "one keystore call per answer"
+        "one keystore call per answer, each delete behind the presence gate"
     );
 }
 
 /// The presence gate (ledger #201) is asked only once every other check has passed, and
 /// what it answers stands. Generate under root into a fresh name checks both names are
 /// free, THEN asks, then mints; into a name already holding a secret it refuses without
-/// asking. A gate that finds nobody turns unlock and generate into its `Denied`, and
-/// generate then stores nothing.
+/// asking. A gate that finds nobody turns unlock, generate and a `Delete` into its `Denied`;
+/// generate then stores nothing, and the `Delete` deletes nothing.
 #[test]
 fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
     let (kernel, backend, _dir) = fixture();
@@ -938,4 +943,80 @@ fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
         [Op::Exists("n".into()), Op::Exists("n.pub".into())],
         "generate checked, was refused presence, and stored nothing"
     );
+
+    // And a Delete refused presence deletes nothing: the gate's refusal is the answer,
+    // under root as under the exact grant, and the keystore is never asked to delete.
+    for capability in [root.clone(), delete(NAME)] {
+        let err = issue(&kernel, Verb::Delete, &secret_iri(NAME), &[], &capability).unwrap_err();
+        assert!(
+            matches!(&err, Error::Denied(why) if why == "nobody at the machine"),
+            "delete: {err:?}"
+        );
+    }
+    assert_eq!(
+        backend.inner.get(NAME).unwrap().as_deref(),
+        Some(VALUE),
+        "the secret survives a delete refused presence"
+    );
+    assert_eq!(
+        backend.ops(),
+        [Op::Exists("n".into()), Op::Exists("n.pub".into())],
+        "and the keystore was never asked to delete"
+    );
+}
+
+fn delete(name: &str) -> Capability {
+    scoped(&[&format!("urn:cap:secret:delete:{name}")])
+}
+
+/// A Delete asks the presence gate (Brian, 2026-10-14) once every capability and argument
+/// check has passed, and only then deletes: the gate first, the keystore second, for a
+/// present secret and an absent one alike (the delete is idempotent, and whether the name
+/// held a secret is not consulted before asking). A refused delete never asks: the gate
+/// logs to the same recorder, so an empty log says so.
+#[test]
+fn delete_asks_the_presence_gate_last() {
+    let (kernel, backend, _dir) = fixture();
+    backend.clear();
+
+    // Refused by capability: neither the gate nor the keystore is reached.
+    for capability in [
+        scoped(&[]),
+        delete("other"),
+        scoped(&[
+            &format!("urn:cap:secret:read:{NAME}"),
+            &format!("urn:cap:secret:write:{NAME}"),
+        ]),
+    ] {
+        let err = issue(&kernel, Verb::Delete, &secret_iri(NAME), &[], &capability).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+    }
+    // Refused as an invalid name, before any capability check: nothing reached either.
+    let err = issue(
+        &kernel,
+        Verb::Delete,
+        &secret_iri("-deny-shaped"),
+        &[],
+        &Capability::root(),
+    )
+    .unwrap_err();
+    assert!(matches!(&err, Error::InvalidArgument { .. }), "{err:?}");
+    assert!(backend.ops().is_empty(), "{:?}", backend.ops());
+
+    // Granted: the gate, then the delete.
+    for name in [NAME, ABSENT] {
+        let receipt = issue(&kernel, Verb::Delete, &secret_iri(name), &[], &delete(name)).unwrap();
+        assert_eq!(receipt.bytes, b"deleted");
+    }
+    assert_eq!(
+        backend.ops(),
+        [
+            Op::Presence(format!("Delete secret {NAME}")),
+            Op::Delete(NAME.into()),
+            Op::Presence(format!("Delete secret {ABSENT}")),
+            Op::Delete(ABSENT.into()),
+        ],
+        "asked after every check, before the keystore"
+    );
+    assert!(backend.inner.get(NAME).unwrap().is_none(), "deleted");
 }
