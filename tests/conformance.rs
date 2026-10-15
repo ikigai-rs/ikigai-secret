@@ -11,6 +11,13 @@
 //! wrapped in [`Recording`], which logs every `Backend` call by name — the
 //! only witness to what the walk touched, and to what a refused call did NOT.
 //!
+//! [`Recording`] is also the fixture's **presence gate** (ledger #201): the space is built
+//! with [`ikigai_secret::space_with_gate`], and every time an operation asks for presence the
+//! request lands in the same log, as [`Op::Presence`], in order with the keystore calls. It
+//! always finds someone at the machine, so the platform's real Touch ID prompt is never
+//! reached and `secret-unlock` and `secret-generate` are walked on EVERY platform, macOS
+//! included (they used to be opted out there).
+//!
 //! ## Declarations, and why each
 //!
 //! - `urn:secret` is declared **live** (`Suite::live`), nothing is `pure` and nothing
@@ -29,50 +36,52 @@
 //!   check is dropped and [`names_are_wave_two`] pins the one finding the pass
 //!   will flip. The two endpoints added in this wave (`secret-unlock`,
 //!   `secret-generate`) are kebab-case from birth.
-//! - On macOS, `secret-unlock` and `secret-generate` are opted out of the invoking
-//!   checks: past their capability gate is a REAL Touch ID prompt (`LAContext`),
-//!   which a headless process gets back as `SystemCanceled` — the walk under root
-//!   would report the prompt, not the module. The gate BEFORE the prompt is what
-//!   matters, and [`ungranted_callers_are_refused_before_the_keystore_is_touched`]
-//!   pins it on every platform. Off macOS the prompt is a no-op and both are
-//!   walked: the ubuntu CI job covers what the macOS job cannot.
+//! - Nothing is opted out. The two operations behind the presence gate are walked under
+//!   root with the gate stubbed (above), on every platform.
 //! - `Suite::required_on_mutating()` (conformance 0.8, `REQUIRED`). By default the
-//!   check drops required inputs from `Source`/`Exists` only, and here that is
-//!   VACUOUS on macOS: the `urn:secret` Source's one required input is the `{name}`
-//!   binding (not by value), unlock takes none, and generate (`into`) is opted out
-//!   above. Declaring it holds the Sink too: `content` is dropped from the pipeline
-//!   probe's firing and must be a typed `MissingArgument`. The kernel is the scratch
-//!   file store, so a wrongly accepted drop could only write there, and the endpoint
-//!   refuses before the keystore is consulted (the footprint in [`conforms`] is
-//!   unchanged). A clean report proves the declaration reached a Sink: an unreached
-//!   one is a `DECLARATIONS` finding. Off macOS the walk also drops generate's `into`.
+//!   check drops required inputs from `Source`/`Exists` only: there it drops generate's
+//!   `into` (the `urn:secret` Source and Exists take only the `{name}` binding, not by
+//!   value, and unlock takes none). Declaring it holds the Sink too: `content` is dropped
+//!   from the pipeline probe's firing and must be a typed `MissingArgument`. The kernel is
+//!   the scratch file store, so a wrongly accepted drop could only write there, and the
+//!   endpoint refuses before the keystore is consulted (the footprint in [`conforms`] is
+//!   unchanged). A clean report proves the declaration reached a Sink: an unreached one is
+//!   a `DECLARATIONS` finding. The Delete takes only the binding, so nothing is dropped.
+//! - `urn:secret`'s `Delete` (ledger #202) declares no `content`, so the suite fires it
+//!   only under no grants (ENFORCED), never under root: the walk deletes nothing.
 //!
-//! - Both space constructors are declared **host-named** (`SPACE-NAME`, ledger #987):
-//!   [`ikigai_secret::space`] is parameterized by the backend it is handed, and
-//!   [`ikigai_secret::default_space`] builds over the ambient platform backend (the
-//!   Keychain on macOS, a directory read from the environment elsewhere), so neither
-//!   is configuration-free and only the host knows which instance it holds. The
-//!   fixture's own `space(backend)` is declared by value, the same `Arc` the kernel
-//!   walks. `default_space()` is CONSTRUCTED for its declaration and nothing more:
-//!   building it touches no keystore (the Keychain backend holds a service name until
-//!   it is called; the file backend reads two environment variables), and the check
-//!   reads only `id()` and `topology()`, so it is never invoked.
+//! - The three space constructors are declared **host-named** (`SPACE-NAME`, ledger #987):
+//!   [`ikigai_secret::space_with_gate`] and [`ikigai_secret::space`] are parameterized by the
+//!   backend (and gate) they are handed, and [`ikigai_secret::default_space`] builds over the
+//!   ambient platform backend (the Keychain on macOS, a directory read from the environment
+//!   elsewhere), so none is configuration-free and only the host knows which instance it
+//!   holds. The fixture's own `space_with_gate(backend, gate)` is declared by value, the
+//!   same `Arc` the kernel walks. `space(backend)` and `default_space()` are CONSTRUCTED for
+//!   their declarations and nothing more: building either touches no keystore and asks no
+//!   gate (the Keychain backend holds a service name until it is called; the file backend
+//!   reads two environment variables), and the check reads only `id()` and `topology()`, so
+//!   neither is invoked.
 //!
 //! No module namespace: there is no RDF face (a secret has no graph to skolemize).
 //!
 //! ## What the suite cannot see, pinned by hand
 //!
-//! - **Denied before Exists** ([`ungranted_callers_are_refused_before_the_keystore_is_touched`]):
+//! - **Denied before the keystore** ([`ungranted_callers_are_refused_before_the_keystore_is_touched`]):
 //!   ENFORCED sees a typed `Denied` under no grants; it cannot see that the keystore
 //!   was never consulted, nor that a present and an absent secret refuse
 //!   identically. The recording backend and a second name can. Three capability
 //!   shapes: no grants (the KERNEL refuses on the declared `urn:cap:secret:read:*`
 //!   before the endpoint runs — conformance PENDING #46), a grant on ANOTHER name
 //!   (the wildcard admits the call; the endpoint's per-name rule refuses), and
-//!   the exact grant (one `get`).
+//!   the exact grant (one `get`). Source, Sink, Exists and Delete alike, and the two
+//!   gated operations never ask the presence gate.
+//! - **Exists and Delete** ([`exists_and_delete_answer_under_their_own_scopes`]): the
+//!   answers, the scope each takes (a write grant does not delete), and the keystore calls.
+//! - **The presence gate comes last, and its refusal stands**
+//!   ([`the_presence_gate_is_asked_last_and_its_refusal_stands`]).
 //! - **Required means required** (PENDING #49, [`required_inputs_are_required`]):
 //!   drop `content` from a Sink, `into` from a generate — `MissingArgument`, and
-//!   for generate BEFORE the biometric gate, so this holds on macOS too.
+//!   for generate BEFORE the presence gate.
 //! - **Declared outputs against what is served** (PENDING #11/#31,
 //!   [`declared_outputs_are_the_media_types_served`]).
 //! - **The manifold carries no secret VALUE** ([`the_manifold_carries_no_secret`]):
@@ -81,15 +90,16 @@
 //! - **The walk mutates the fixture** (PENDING #13/#40): PIPELINE fires the Sink
 //!   under root with `content=x`, so after [`conforms`] the seeded secret IS `x`.
 //!   Asserted, with the exact backend log: one `get` (the cache probe's single
-//!   resolution — `Always` returns before a second), one `replace` (the pipeline
-//!   probe's Sink, fired once) — and nothing under no grants.
+//!   resolution — `Always` returns before a second), one `exists` (the same for the
+//!   Exists), one `replace` (the pipeline probe's Sink, fired once) — and nothing under no
+//!   grants.
 
 use ikigai_conformance::{Check, Checks, Fixture, Report, SpaceNaming, Suite};
 use ikigai_core::{
     ArgRef, Capability, Description, EndpointSpace, Error, Expiry, Iri, Kernel, MetaRenderer,
     ReprType, Representation, Request, Verb,
 };
-use ikigai_secret::{Backend, FileBackend, GENERATE_IRI, UNLOCK_IRI};
+use ikigai_secret::{Backend, FileBackend, PresenceGate, GENERATE_IRI, UNLOCK_IRI};
 use std::sync::{Arc, Mutex};
 
 /// The three descriptions `space()` binds, by id, with the IRI each is bound at.
@@ -108,7 +118,7 @@ const ABSENT: &str = "absent";
 /// The value the suite's PIPELINE probe writes: `sample_value` of an `xsd:string`.
 const PROBE_CONTENT: &[u8] = b"x";
 
-/// One keystore operation the walk performed.
+/// One keystore operation the walk performed, or one request for presence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
     Get(String),
@@ -116,9 +126,12 @@ enum Op {
     Delete(String),
     Exists(String),
     Replace(String),
+    /// The presence gate was asked, with this reason.
+    Presence(String),
 }
 
-/// A backend that logs every operation by name and delegates to the file store.
+/// A backend that logs every operation by name and delegates to the file store; and the
+/// fixture's presence gate, which logs each request and finds someone at the machine.
 struct Recording {
     inner: FileBackend,
     log: Mutex<Vec<Op>>,
@@ -137,6 +150,18 @@ impl Recording {
                 Op::Get(n) | Op::Set(n) | Op::Delete(n) | Op::Exists(n) | Op::Replace(n) => {
                     n == name
                 }
+                Op::Presence(_) => false,
+            })
+            .collect()
+    }
+
+    /// The reasons the presence gate was asked with, in order.
+    fn presence(&self) -> Vec<String> {
+        self.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Presence(reason) => Some(reason),
+                _ => None,
             })
             .collect()
     }
@@ -169,6 +194,13 @@ impl Backend for Recording {
     }
 }
 
+impl PresenceGate for Recording {
+    fn require(&self, reason: &str) -> ikigai_core::Result<()> {
+        self.log.lock().unwrap().push(Op::Presence(reason.into()));
+        Ok(())
+    }
+}
+
 /// The smallest `Meta` renderer: every field of the description, as text. The
 /// catalog and a `Meta` request both render through it, and a leak check wants
 /// every field visible, so `Debug` is the right face here.
@@ -188,7 +220,8 @@ impl MetaRenderer for EveryField {
 }
 
 /// A fresh fixture: the file keystore over a scratch directory, seeded with one
-/// secret, logged. The directory lives as long as the guard.
+/// secret, logged, and the same recorder as the presence gate. The directory lives as long
+/// as the guard.
 fn fixture() -> (Kernel, Arc<Recording>, tempfile::TempDir) {
     let (kernel, _space, backend, dir) = fixture_with_space();
     (kernel, backend, dir)
@@ -208,76 +241,52 @@ fn fixture_with_space() -> (
         log: Mutex::new(Vec::new()),
     });
     backend.inner.set(NAME, VALUE).expect("seed");
-    let space = Arc::new(ikigai_secret::space(backend.clone()));
+    let space = Arc::new(ikigai_secret::space_with_gate(
+        backend.clone(),
+        backend.clone(),
+    ));
     let kernel = Kernel::with_meta_renderer(space.clone(), Arc::new(EveryField));
     (kernel, space, backend, dir)
 }
 
-/// The labels the two space constructors are declared under.
-const SPACE_LABEL: &str = "ikigai_secret::space(backend)";
+/// The labels the three space constructors are declared under.
+const SPACE_LABEL: &str = "ikigai_secret::space_with_gate(backend, gate)";
+const PLAIN_SPACE_LABEL: &str = "ikigai_secret::space(backend)";
 const DEFAULT_SPACE_LABEL: &str = "ikigai_secret::default_space()";
 
-/// The suite for this module: the seeded name bound on both verbs of `urn:secret`
+/// The suite for this module: the seeded name bound on every verb of `urn:secret`
 /// (a fixture per verb, so the intent survives a suite that looks bindings up per
 /// action), `urn:secret` declared live, NAMES dropped (wave two), REQUIRED held on
-/// the Sink too, both space
-/// constructors declared host-named (`space` as the instance the kernel walks), and
-/// on macOS the two biometric operations opted out of the invoking checks — see the
-/// file docs.
-fn suite(space: Arc<EndpointSpace>) -> Suite {
-    let suite = Suite::new()
+/// the Sink too, and the three space constructors declared host-named
+/// (`space_with_gate` as the instance the kernel walks; `space` over a scratch store it
+/// never touches) — see the file docs. Nothing is opted out.
+fn suite(space: Arc<EndpointSpace>, scratch: &std::path::Path) -> Suite {
+    let plain = ikigai_secret::space(Arc::new(FileBackend::new(scratch.join("never-walked"))));
+    Suite::new()
         .checks(Checks::all() - Checks::NAMES)
         .live(SECRET)
         .required_on_mutating()
         .fixture(Fixture::new(SECRET, Verb::Source).binding("name", NAME))
         .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME))
+        .fixture(Fixture::new(SECRET, Verb::Exists).binding("name", NAME))
+        .fixture(Fixture::new(SECRET, Verb::Delete).binding("name", NAME))
         .host_named_space(SPACE_LABEL, space)
-        .host_named_space(DEFAULT_SPACE_LABEL, ikigai_secret::default_space());
-    #[cfg(target_os = "macos")]
-    let suite = suite
-        .opt_out(
-            UNLOCK,
-            Some(Verb::Source),
-            "past the capability gate is a real Touch ID prompt (TCC): headless it is \
-             SystemCanceled, not the module; the gate is pinned by hand",
-        )
-        .opt_out(
-            GENERATE,
-            Some(Verb::Source),
-            "past the capability gate is a real Touch ID prompt (TCC): headless it is \
-             SystemCanceled, not the module; the gate is pinned by hand",
-        );
-    suite
+        .host_named_space(PLAIN_SPACE_LABEL, plain)
+        .host_named_space(DEFAULT_SPACE_LABEL, ikigai_secret::default_space())
 }
 
-/// Whether the biometric operations were walked under root (they are, wherever
-/// `require_biometric` is a no-op).
-const BIOMETRIC_WALKED: bool = !cfg!(target_os = "macos");
-
-/// The walk saw three endpoints and four actions (`urn:secret` Source + Sink,
-/// one Source each for unlock and generate), skipped exactly NAMES, and opted out
-/// exactly the biometric operations on macOS. A fourth endpoint bound without a
-/// line here is held to a weaker standard.
+/// The walk saw three endpoints and six actions (`urn:secret` Source + Sink + Exists +
+/// Delete, one Source each for unlock and generate), skipped exactly NAMES, and opted out
+/// nothing. A fourth endpoint bound without a line here is held to a weaker standard.
 fn assert_shape(report: &Report) {
     assert_eq!(report.endpoints, 3, "{report}");
-    assert_eq!(report.actions, 4, "{report}");
+    assert_eq!(report.actions, 6, "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
         vec![Check::Names],
         "only NAMES is skipped: {report}"
     );
-    let opted: Vec<&str> = report
-        .declared
-        .opted_out
-        .iter()
-        .map(|o| o.endpoint.as_str())
-        .collect();
-    let expected: &[&str] = if BIOMETRIC_WALKED {
-        &[]
-    } else {
-        &[UNLOCK, GENERATE]
-    };
-    assert_eq!(opted, expected, "{report}");
+    assert!(report.declared.opted_out.is_empty(), "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
     assert!(report.declared.cacheable.is_empty(), "{report}");
     assert_eq!(report.declared.live, [SECRET], "{report}");
@@ -293,29 +302,35 @@ fn assert_shape(report: &Report) {
         spaces,
         [
             (SPACE_LABEL, &SpaceNaming::HostNamed),
+            (PLAIN_SPACE_LABEL, &SpaceNaming::HostNamed),
             (DEFAULT_SPACE_LABEL, &SpaceNaming::HostNamed)
         ],
-        "both constructors declared, both host-named: {report}"
+        "every constructor declared, each host-named: {report}"
     );
 }
 
 #[test]
 fn conforms() {
-    let (kernel, space, backend, _dir) = fixture_with_space();
-    let report = suite(space).run_blocking(&kernel);
+    let (kernel, space, backend, dir) = fixture_with_space();
+    let report = suite(space, dir.path()).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
 
     // The walk's footprint on the keystore, exactly: the cache probe read the
-    // seeded secret once (`Always` needs no second resolution), the pipeline
-    // probe fired the Sink once (one `replace`: the file store's is atomic, never a
-    // delete then a set), and ENFORCED — under no grants — never reached the store.
-    // REQUIRED's Sink without `content` was refused before the store too.
+    // seeded secret once (`Always` needs no second resolution) and asked whether it
+    // exists once, the pipeline probe fired the Sink once (one `replace`: the file
+    // store's is atomic, never a delete then a set), and ENFORCED — under no grants —
+    // never reached the store, so the Delete deleted nothing. REQUIRED's Sink without
+    // `content` was refused before the store too.
     assert_eq!(
         backend.ops_on(NAME),
-        [Op::Get(NAME.into()), Op::Replace(NAME.into())],
+        [
+            Op::Get(NAME.into()),
+            Op::Replace(NAME.into()),
+            Op::Exists(NAME.into())
+        ],
         "the walk's footprint on the seeded secret"
     );
     // PENDING #40: the walk mutates the fixture — the seeded secret is now the
@@ -325,38 +340,35 @@ fn conforms() {
         Some(PROBE_CONTENT),
         "the pipeline probe's Sink landed"
     );
-    // Wherever generate was walked, its minimal call (`into=x`) checked that
-    // neither name held a secret (generate never replaces), then minted the pair.
+    // Generate's minimal call (`into=x`) checked that neither name held a secret
+    // (generate never replaces), asked for presence, then minted the pair; unlock asked
+    // for presence. On every platform: the gate is the stub, never a Touch ID prompt.
     let minted: Vec<Op> = backend
         .ops()
         .into_iter()
-        .filter(|op| matches!(op, Op::Set(n) | Op::Exists(n) if n == "x" || n == "x.pub"))
+        .filter(|op| match op {
+            Op::Set(n) | Op::Exists(n) => n == "x" || n == "x.pub",
+            Op::Presence(_) => true,
+            _ => false,
+        })
         .collect();
-    if BIOMETRIC_WALKED {
-        assert_eq!(
-            minted,
-            [
-                Op::Exists("x".into()),
-                Op::Exists("x.pub".into()),
-                Op::Set("x".into()),
-                Op::Set("x.pub".into())
-            ]
-        );
-        assert_eq!(
-            backend.ops().len(),
-            6,
-            "and nothing else: {:?}",
-            backend.ops()
-        );
-    } else {
-        assert!(minted.is_empty(), "opted out: nothing minted: {minted:?}");
-        assert_eq!(
-            backend.ops().len(),
-            2,
-            "and nothing else: {:?}",
-            backend.ops()
-        );
-    }
+    assert_eq!(
+        minted,
+        [
+            Op::Presence("Unlock ikigai secrets".into()),
+            Op::Exists("x".into()),
+            Op::Exists("x.pub".into()),
+            Op::Presence("Generate signing key x".into()),
+            Op::Set("x".into()),
+            Op::Set("x.pub".into())
+        ]
+    );
+    assert_eq!(
+        backend.ops().len(),
+        9,
+        "and nothing else: {:?}",
+        backend.ops()
+    );
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {
@@ -409,7 +421,7 @@ fn reads_are_never_cached() {
     );
 }
 
-/// Denied before Exists. Under no grants and under a grant on ANOTHER name, a
+/// Denied before the keystore. Under no grants and under a grant on ANOTHER name, a
 /// present secret and an absent one refuse identically — a typed, permanent
 /// `Denied` whose text differs only by the name asked for — and the keystore is
 /// never consulted, so an ungranted caller cannot learn whether a name exists.
@@ -417,10 +429,10 @@ fn reads_are_never_cached() {
 /// declared wildcard before the endpoint runs (the denial names the wildcard);
 /// with a grant on another name the wildcard admits the call and the endpoint's
 /// per-name rule refuses it (the denial names the exact scope). The same holds
-/// for the Sink, and for the two biometric operations, whose denial is the
-/// capability's — never `biometric check failed`, which would mean a prompt was
-/// reached. Under the exact grant: one `get`, and an absent name is a typed
-/// `NotFound`.
+/// for the Sink, the Exists and the Delete, and for the two gated operations, whose
+/// denial is the capability's: the presence gate is never asked (it logs to the same
+/// recorder, so an empty log says so). Under the exact grant: one `get`, and an absent
+/// name is a typed `NotFound`.
 #[test]
 fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
     let (kernel, backend, _dir) = fixture();
@@ -428,8 +440,10 @@ fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
 
     let read_wildcard = "urn:cap:secret:read:*";
     let write_wildcard = "urn:cap:secret:write:*";
+    let delete_wildcard = "urn:cap:secret:delete:*";
     let other_read = "urn:cap:secret:read:other";
     let other_write = "urn:cap:secret:write:other";
+    let other_delete = "urn:cap:secret:delete:other";
     let deny = |verb: Verb, iri: &str, capability: &Capability| -> String {
         let err = issue(
             &kernel,
@@ -445,13 +459,21 @@ fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
         err.to_string()
     };
 
-    // Source and Sink, under no grants (kernel floor) and under another name's
-    // grant (endpoint rule): present and absent refuse identically.
+    // Source, Sink, Exists and Delete, under no grants (kernel floor) and under another
+    // name's grant (endpoint rule): present and absent refuse identically.
     for (verb, capability, names) in [
         (Verb::Source, scoped(&[]), read_wildcard),
         (Verb::Source, scoped(&[other_read]), "urn:cap:secret:read:"),
         (Verb::Sink, scoped(&[]), write_wildcard),
         (Verb::Sink, scoped(&[other_write]), "urn:cap:secret:write:"),
+        (Verb::Exists, scoped(&[]), read_wildcard),
+        (Verb::Exists, scoped(&[other_read]), "urn:cap:secret:read:"),
+        (Verb::Delete, scoped(&[]), delete_wildcard),
+        (
+            Verb::Delete,
+            scoped(&[other_delete]),
+            "urn:cap:secret:delete:",
+        ),
     ] {
         let present = deny(verb, &secret_iri(NAME), &capability);
         let absent = deny(verb, &secret_iri(ABSENT), &capability);
@@ -477,26 +499,38 @@ fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
         &secret_iri(NAME),
         &scoped(&[&format!("urn:cap:secret:write:{NAME}")]),
     );
-    // The biometric operations refuse on their capability, before any prompt.
+    // The gated operations refuse on their capability, before the presence gate.
     for (iri, scope) in [
         (UNLOCK_IRI, "urn:cap:secret:unlock"),
         (GENERATE_IRI, "urn:cap:secret:generate"),
     ] {
-        for capability in [scoped(&[]), scoped(&[other_read, other_write])] {
+        for capability in [
+            scoped(&[]),
+            scoped(&[other_read, other_write, other_delete]),
+        ] {
             let err = issue(&kernel, Verb::Source, iri, &[("into", "k")], &capability)
                 .err()
                 .unwrap_or_else(|| panic!("{iri} resolved under {capability:?}"));
             assert!(matches!(err, Error::Denied(_)), "{iri}: {err:?}");
             assert!(err.to_string().contains(scope), "{iri}: {err}");
-            assert!(
-                !err.to_string().contains("biometric"),
-                "{iri}: the capability refused, not the prompt: {err}"
-            );
         }
+    }
+    // A delete grant does not read (or ask), and a read or write grant does not delete.
+    deny(
+        Verb::Exists,
+        &secret_iri(NAME),
+        &scoped(&[&format!("urn:cap:secret:delete:{NAME}")]),
+    );
+    for scope in ["read", "write"] {
+        deny(
+            Verb::Delete,
+            &secret_iri(NAME),
+            &scoped(&[&format!("urn:cap:secret:{scope}:{NAME}")]),
+        );
     }
     assert!(
         backend.ops().is_empty(),
-        "no refused call reached the keystore: {:?}",
+        "no refused call reached the keystore or the presence gate: {:?}",
         backend.ops()
     );
     assert_eq!(
@@ -528,11 +562,9 @@ fn ungranted_callers_are_refused_before_the_keystore_is_touched() {
 
 /// PENDING #49: a required input dropped from an otherwise valid call is a
 /// `MissingArgument` naming it — `content` on the Sink, `into` on generate — and
-/// the keystore is untouched. Generate reads `into` BEFORE its biometric gate,
-/// so this holds on macOS with no prompt. Since conformance 0.8 the suite's
-/// REQUIRED check sees the typed refusal for the Sink on every platform and for
-/// generate off macOS; this test still owns generate on macOS (opted out of the
-/// walk), the NAME of the missing argument, and the untouched keystore.
+/// the keystore is untouched and the presence gate never asked. Since conformance 0.8
+/// the suite's REQUIRED check sees both typed refusals; this test owns the NAME of the
+/// missing argument, and the untouched keystore and gate.
 #[test]
 fn required_inputs_are_required() {
     let (kernel, backend, _dir) = fixture();
@@ -583,10 +615,10 @@ fn declared_outputs(kernel: &Kernel, pattern: &str) -> Vec<Vec<String>> {
 /// What `ikigai-conformance` 0.1.0 does not check (PENDING #11/#31): a declared
 /// output that is not an RDF face is never compared with what the action serves.
 /// Read by hand, then pinned: `urn:secret` serves bytes on Source and a
-/// `text/plain` receipt on Sink; unlock serves `text/plain`; generate serves the
-/// PEM public key for `ed25519` and the `text/plain` recipient for `age` — two
-/// declared outputs, each served by one `type`. The biometric operations are
-/// fired only where their prompt is a no-op.
+/// `text/plain` answer on Sink, Exists and Delete; unlock serves `text/plain`; generate
+/// serves the PEM public key for `ed25519` and the `text/plain` recipient for `age` — two
+/// declared outputs, each served by one `type`. The gated operations are fired through
+/// the stub gate, on every platform.
 #[test]
 fn declared_outputs_are_the_media_types_served() {
     let (kernel, _backend, _dir) = fixture();
@@ -598,8 +630,13 @@ fn declared_outputs_are_the_media_types_served() {
 
     assert_eq!(
         declared_outputs(&kernel, SECRET_TEMPLATE),
-        [vec!["application/octet-stream"], vec!["text/plain"]],
-        "Source, then Sink"
+        [
+            vec!["application/octet-stream"],
+            vec!["text/plain"],
+            vec!["text/plain"],
+            vec!["text/plain"]
+        ],
+        "Source, Sink, Exists, Delete"
     );
     assert_eq!(
         served(Verb::Source, &secret_iri(NAME), &[]),
@@ -609,33 +646,33 @@ fn declared_outputs_are_the_media_types_served() {
         served(Verb::Sink, &secret_iri(NAME), &[("content", "v")]),
         "text/plain"
     );
+    assert_eq!(served(Verb::Exists, &secret_iri(NAME), &[]), "text/plain");
+    assert_eq!(served(Verb::Delete, &secret_iri(NAME), &[]), "text/plain");
 
     assert_eq!(declared_outputs(&kernel, UNLOCK_IRI), [vec!["text/plain"]]);
     let generate = declared_outputs(&kernel, GENERATE_IRI);
     assert_eq!(generate, [vec!["application/x-pem-file", "text/plain"]]);
-    if BIOMETRIC_WALKED {
-        assert_eq!(served(Verb::Source, UNLOCK_IRI, &[]), "text/plain");
-        assert_eq!(
-            served(Verb::Source, GENERATE_IRI, &[("into", "k1")]),
-            "application/x-pem-file"
-        );
-        assert_eq!(
-            served(
-                Verb::Source,
-                GENERATE_IRI,
-                &[("into", "k2"), ("type", "ed25519")]
-            ),
-            "application/x-pem-file"
-        );
-        assert_eq!(
-            served(
-                Verb::Source,
-                GENERATE_IRI,
-                &[("into", "k3"), ("type", "age")]
-            ),
-            "text/plain"
-        );
-    }
+    assert_eq!(served(Verb::Source, UNLOCK_IRI, &[]), "text/plain");
+    assert_eq!(
+        served(Verb::Source, GENERATE_IRI, &[("into", "k1")]),
+        "application/x-pem-file"
+    );
+    assert_eq!(
+        served(
+            Verb::Source,
+            GENERATE_IRI,
+            &[("into", "k2"), ("type", "ed25519")]
+        ),
+        "application/x-pem-file"
+    );
+    assert_eq!(
+        served(
+            Verb::Source,
+            GENERATE_IRI,
+            &[("into", "k3"), ("type", "age")]
+        ),
+        "text/plain"
+    );
 }
 
 /// The manifold must not leak. `describe()`, the catalog, the action manifold
@@ -697,9 +734,9 @@ fn names_are_wave_two() {
     assert!(backend.ops().is_empty(), "NAMES is a static check");
 }
 
-/// The contract as the manifold states it: `urn:secret` has a Source under the
-/// read wildcard and a Sink under the write wildcard, each binding `name`, the
-/// Sink requiring `content`; unlock one Source under its own exact capability;
+/// The contract as the manifold states it: `urn:secret` has a Source and an Exists
+/// under the read wildcard, a Sink under the write wildcard and a Delete under the delete
+/// wildcard, each binding `name`, the Sink requiring `content`; unlock one Source under its own exact capability;
 /// generate one Source under its own capability AND the write wildcard (it writes
 /// `<into>` and `<into>.pub`, whose exact scopes it checks at invoke); every input
 /// has a class; generate's `into` is required and
@@ -724,6 +761,16 @@ fn the_manifold_states_the_contract() {
                     Verb::Sink,
                     &["urn:cap:secret:write:*"],
                     vec![("name", true), ("content", true)],
+                ),
+                (
+                    Verb::Exists,
+                    &["urn:cap:secret:read:*"],
+                    vec![("name", true)],
+                ),
+                (
+                    Verb::Delete,
+                    &["urn:cap:secret:delete:*"],
+                    vec![("name", true)],
                 ),
             ],
         ),
@@ -781,4 +828,114 @@ fn the_manifold_states_the_contract() {
         .unwrap();
     assert_eq!(kind.one_of, ["ed25519", "age"]);
     assert_eq!(kind.default.as_deref(), Some("ed25519"));
+}
+
+/// Exists and Delete (ledger #202), each under its own scope. Exists answers `true` or
+/// `false` under the read scope, never cached; Delete removes the secret under
+/// `urn:cap:secret:delete:<name>` and is idempotent; afterward Exists says `false` and a
+/// read is a typed `NotFound`. One keystore call per answer, the scope checked first.
+#[test]
+fn exists_and_delete_answer_under_their_own_scopes() {
+    let (kernel, backend, _dir) = fixture();
+    backend.clear();
+    let read = |name: &str| scoped(&[&format!("urn:cap:secret:read:{name}")]);
+    let delete = |name: &str| scoped(&[&format!("urn:cap:secret:delete:{name}")]);
+    let exists = |name: &str| {
+        let repr = issue(&kernel, Verb::Exists, &secret_iri(name), &[], &read(name))
+            .unwrap_or_else(|e| panic!("exists {name}: {e}"));
+        assert_eq!(
+            repr.expiry,
+            Expiry::Always,
+            "whether a secret exists is live"
+        );
+        String::from_utf8(repr.bytes).unwrap()
+    };
+
+    assert_eq!(exists(NAME), "true");
+    assert_eq!(exists(ABSENT), "false");
+
+    let receipt = issue(&kernel, Verb::Delete, &secret_iri(NAME), &[], &delete(NAME)).unwrap();
+    assert_eq!(receipt.bytes, b"deleted", "the reply carries no material");
+    assert_eq!(exists(NAME), "false", "deleted");
+    let err = issue(&kernel, Verb::Source, &secret_iri(NAME), &[], &read(NAME)).unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    // Idempotent: deleting what is not there answers the same.
+    let again = issue(&kernel, Verb::Delete, &secret_iri(NAME), &[], &delete(NAME)).unwrap();
+    assert_eq!(again.bytes, b"deleted");
+
+    assert_eq!(
+        backend.ops(),
+        [
+            Op::Exists(NAME.into()),
+            Op::Exists(ABSENT.into()),
+            Op::Delete(NAME.into()),
+            Op::Exists(NAME.into()),
+            Op::Get(NAME.into()),
+            Op::Delete(NAME.into()),
+        ],
+        "one keystore call per answer"
+    );
+}
+
+/// The presence gate (ledger #201) is asked only once every other check has passed, and
+/// what it answers stands. Generate under root into a fresh name checks both names are
+/// free, THEN asks, then mints; into a name already holding a secret it refuses without
+/// asking. A gate that finds nobody turns unlock and generate into its `Denied`, and
+/// generate then stores nothing.
+#[test]
+fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
+    let (kernel, backend, _dir) = fixture();
+    backend.clear();
+    let root = Capability::root();
+
+    issue(&kernel, Verb::Source, GENERATE_IRI, &[("into", "k")], &root).unwrap();
+    let err = issue(
+        &kernel,
+        Verb::Source,
+        GENERATE_IRI,
+        &[("into", NAME)],
+        &root,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument { name, .. } if name == "into"),
+        "{err:?}"
+    );
+    assert_eq!(
+        backend.ops(),
+        [
+            Op::Exists("k".into()),
+            Op::Exists("k.pub".into()),
+            Op::Presence("Generate signing key k".into()),
+            Op::Set("k".into()),
+            Op::Set("k.pub".into()),
+            Op::Exists(NAME.into()),
+        ],
+        "asked after the checks, before the store; not at all for a refused name"
+    );
+    assert_eq!(backend.presence().len(), 1);
+
+    // Nobody at the machine: the gate's refusal is the answer, and nothing is stored.
+    let nobody =
+        |_: &str| -> ikigai_core::Result<()> { Err(Error::Denied("nobody at the machine".into())) };
+    let kernel = Kernel::new(Arc::new(ikigai_secret::space_with_gate(
+        backend.clone(),
+        Arc::new(nobody),
+    )));
+    backend.clear();
+    for (iri, args) in [
+        (UNLOCK_IRI, &[][..]),
+        (GENERATE_IRI, &[("into", "n"), ("type", "age")][..]),
+    ] {
+        let err = issue(&kernel, Verb::Source, iri, args, &root).unwrap_err();
+        assert!(
+            matches!(&err, Error::Denied(why) if why == "nobody at the machine"),
+            "{iri}: {err:?}"
+        );
+    }
+    assert_eq!(
+        backend.ops(),
+        [Op::Exists("n".into()), Op::Exists("n.pub".into())],
+        "generate checked, was refused presence, and stored nothing"
+    );
 }
