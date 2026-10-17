@@ -91,7 +91,7 @@ each operation only to a holder of its scope.
 The two reserved operations are bound EXACTLY, ahead of the template, so a secret can never
 be stored under either name. Each id is the endpoint's one name: the `Description` id equals
 `Endpoint::name()`, a kebab-case noun (ledger #11; the template's id was `urn:secret` until
-the naming wave, see Unreleased).
+the naming wave, see 0.2.0).
 
 **Passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)**
 (`tests/conformance.rs`): the suite walks the three endpoints over the file keystore in a
@@ -146,42 +146,6 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   that folds case. A secret stored under a name outside the verbatim set must be stored
   again.
 
-## Unreleased
-
-### Renamed (BREAKING for anyone matching on ids or MCP tool names)
-
-The naming wave (ledger #11): a resource name is a short kebab-case noun, and the
-`Description` id is that name, not an IRI. One id changes; no IRI does, so nothing that
-resolves `urn:secret:{name}` changes.
-
-| what | old | new |
-| --- | --- | --- |
-| id of the `urn:secret:{name}` endpoint (the catalog label) | `urn:secret` | `secret` |
-| its MCP tool names (one per verb) | `urn_secret__source`, `…__sink`, `…__exists`, `…__delete` | `secret__source`, `secret__sink`, `secret__exists`, `secret__delete` |
-
-`secret-unlock` and `secret-generate` already conformed and are unchanged. The id now equals
-`Endpoint::name()` (`secret`), so a conformance fixture keyed by either name reaches the
-endpoint; before, one keyed by `secret` was silently ignored. The conformance suite now runs
-`NAMES` too. A breaking change under 0.x, so the release is a minor bump.
-
-### Added
-
-- **The presence gate is injectable** (ledger #201): `PresenceGate`, `BiometricGate` and
-  `space_with_gate(backend, gate)`. `space(backend)` is unchanged in behavior (it uses
-  `BiometricGate`), and `require_biometric` stays public. The conformance walk and the
-  generate tests now run on macOS with the gate stubbed; the macOS opt-outs are gone.
-- **`Exists` and `Delete` on `urn:secret:{name}`** (ledger #202), each a per-verb action:
-  `Exists` under `urn:cap:secret:read:*`, `Delete` under the new `urn:cap:secret:delete:*`
-  (the exact name at invoke). A manifold change: a holder of a delete scope is now offered
-  `Delete`, and nothing a host already granted gains it. Tested over the file store; over the
-  Keychain both run the backend's existing `exists` (a read of the item) and `delete`, which
-  no test reaches (TCC).
-- **`Delete` asks for presence** (ledger #1525, Brian 2026-10-14): like unlock and generate, a
-  `Delete` on `urn:secret:{name}` asks the presence gate after every capability and argument
-  check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
-  is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
-  `space_with_gate`. A refused-by-capability delete never asks.
-
 ## 0.1.7 (2026-10-07)
 
 Fixes for audit round 3 (ledger #854, and #203). **Version call: a patch, 0.1.7.** The Rust
@@ -223,6 +187,42 @@ only verbatim-set names. What changes for a caller:
   at the box (the file name is the secret's name, `-` kept verbatim) and read it under the new
   name. The library's `ikigai-core` floor is unchanged (`0.1.58`): the refusal uses no new
   core API, and it behaves the same on every core version.
+
+## 0.2.0 (2026-10-17)
+
+### Renamed (BREAKING for anyone matching on ids or MCP tool names)
+
+The naming wave (ledger #11): a resource name is a short kebab-case noun, and the
+`Description` id is that name, not an IRI. One id changes; no IRI does, so nothing that
+resolves `urn:secret:{name}` changes.
+
+| what | old | new |
+| --- | --- | --- |
+| id of the `urn:secret:{name}` endpoint (the catalog label) | `urn:secret` | `secret` |
+| its MCP tool names (one per verb) | `urn_secret__source`, `…__sink`, `…__exists`, `…__delete` | `secret__source`, `secret__sink`, `secret__exists`, `secret__delete` |
+
+`secret-unlock` and `secret-generate` already conformed and are unchanged. The id now equals
+`Endpoint::name()` (`secret`), so a conformance fixture keyed by either name reaches the
+endpoint; before, one keyed by `secret` was silently ignored. The conformance suite now runs
+`NAMES` too. A breaking change under 0.x, so the release is a minor bump.
+
+### Added
+
+- **The presence gate is injectable** (ledger #201): `PresenceGate`, `BiometricGate` and
+  `space_with_gate(backend, gate)`. `space(backend)` is unchanged in behavior (it uses
+  `BiometricGate`), and `require_biometric` stays public. The conformance walk and the
+  generate tests now run on macOS with the gate stubbed; the macOS opt-outs are gone.
+- **`Exists` and `Delete` on `urn:secret:{name}`** (ledger #202), each a per-verb action:
+  `Exists` under `urn:cap:secret:read:*`, `Delete` under the new `urn:cap:secret:delete:*`
+  (the exact name at invoke). A manifold change: a holder of a delete scope is now offered
+  `Delete`, and nothing a host already granted gains it. Tested over the file store; over the
+  Keychain both run the backend's existing `exists` (a read of the item) and `delete`, which
+  no test reaches (TCC).
+- **`Delete` asks for presence** (ledger #1525, Brian 2026-10-14): like unlock and generate, a
+  `Delete` on `urn:secret:{name}` asks the presence gate after every capability and argument
+  check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
+  is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
+  `space_with_gate`. A refused-by-capability delete never asks.
 
 ## Next slices
 
