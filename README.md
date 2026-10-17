@@ -83,18 +83,19 @@ each operation only to a holder of its scope.
 |---|---|---|---|
 | `urn:secret:unlock` | `secret-unlock` | Source | `urn:cap:secret:unlock` |
 | `urn:secret:generate` | `secret-generate` | Source | `urn:cap:secret:generate` AND `urn:cap:secret:write:*` (the exact `<into>` and `<into>.pub` at invoke) |
-| `urn:secret:{name}` | `urn:secret` | Source | `urn:cap:secret:read:*` (the exact name at invoke) |
-| `urn:secret:{name}` | `urn:secret` | Sink | `urn:cap:secret:write:*` (the exact name at invoke) |
-| `urn:secret:{name}` | `urn:secret` | Exists | `urn:cap:secret:read:*` (the exact name at invoke) |
-| `urn:secret:{name}` | `urn:secret` | Delete | `urn:cap:secret:delete:*` (the exact name at invoke), then presence |
+| `urn:secret:{name}` | `secret` | Source | `urn:cap:secret:read:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `secret` | Sink | `urn:cap:secret:write:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `secret` | Exists | `urn:cap:secret:read:*` (the exact name at invoke) |
+| `urn:secret:{name}` | `secret` | Delete | `urn:cap:secret:delete:*` (the exact name at invoke), then presence |
 
 The two reserved operations are bound EXACTLY, ahead of the template, so a secret can never
-be stored under either name. The id `urn:secret` predates the kebab-case convention and is
-a live MCP tool name; it is renamed in the coordinated wave-two pass, not here.
+be stored under either name. Each id is the endpoint's one name: the `Description` id equals
+`Endpoint::name()`, a kebab-case noun (ledger #11; the template's id was `urn:secret` until
+the naming wave, see Unreleased).
 
 **Passes [`ikigai-conformance`](https://crates.io/crates/ikigai-conformance)**
 (`tests/conformance.rs`): the suite walks the three endpoints over the file keystore in a
-scratch directory with `urn:secret` declared live (`Suite::live`), so a secret read that
+scratch directory with `secret` declared live (`Suite::live`), so a secret read that
 turns cacheable is a red test. The test pins by hand what the suite cannot see — every read
 reaches the keystore, under a narrow grant as under root, an ungranted caller is refused
 identically for a present and an absent secret with the keystore never consulted, the
@@ -146,6 +147,24 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   again.
 
 ## Unreleased
+
+### Renamed (BREAKING for anyone matching on ids or MCP tool names)
+
+The naming wave (ledger #11): a resource name is a short kebab-case noun, and the
+`Description` id is that name, not an IRI. One id changes; no IRI does, so nothing that
+resolves `urn:secret:{name}` changes.
+
+| what | old | new |
+| --- | --- | --- |
+| id of the `urn:secret:{name}` endpoint (the catalog label) | `urn:secret` | `secret` |
+| its MCP tool names (one per verb) | `urn_secret__source`, `…__sink`, `…__exists`, `…__delete` | `secret__source`, `secret__sink`, `secret__exists`, `secret__delete` |
+
+`secret-unlock` and `secret-generate` already conformed and are unchanged. The id now equals
+`Endpoint::name()` (`secret`), so a conformance fixture keyed by either name reaches the
+endpoint; before, one keyed by `secret` was silently ignored. The conformance suite now runs
+`NAMES` too. A breaking change under 0.x, so the release is a minor bump.
+
+### Added
 
 - **The presence gate is injectable** (ledger #201): `PresenceGate`, `BiometricGate` and
   `space_with_gate(backend, gate)`. `space(backend)` is unchanged in behavior (it uses
