@@ -20,7 +20,7 @@
 //!
 //! ## Declarations, and why each
 //!
-//! - `urn:secret` is declared **live** (`Suite::live`), nothing is `pure` and nothing
+//! - `secret` is declared **live** (`Suite::live`), nothing is `pure` and nothing
 //!   is `cacheable`: a secret read must NEVER be cacheable (a cached secret is a secret
 //!   with no thread and no expiry), so every read is `Expiry::Always`. Without the
 //!   declaration the cache probe is silent on an `Always` result and equally silent on
@@ -29,25 +29,22 @@
 //!   declaration applies to the Source only (the Sink is mutating, so `CACHEABLE` does
 //!   not run there). [`reads_are_never_cached`] keeps what the probe's one resolution
 //!   under root cannot see: a narrow grant, and every read reaching the keystore.
-//! - `NAMES` is skipped suite-wide, not opted out per id: the id `urn:secret` is a
-//!   live MCP tool name (`urn_secret__source`), renamed in one coordinated pass
-//!   (wave two, owned by `ikigai-core-PENDING.md` §1). `Suite::opt_out` cannot
-//!   carry this — it drops the INVOKING checks and leaves NAMES running — so the
-//!   check is dropped and [`names_are_wave_two`] pins the one finding the pass
-//!   will flip. The two endpoints added in this wave (`secret-unlock`,
-//!   `secret-generate`) are kebab-case from birth.
+//! - Every check runs, `NAMES` included: the stored-secret endpoint's id is `secret`
+//!   (ledger #11's naming wave renamed it from the full IRI `urn:secret`), the same as its
+//!   `Endpoint::name()`, and `secret-unlock` and `secret-generate` were kebab-case from
+//!   birth. [`names_conform`] pins the three ids.
 //! - Nothing is opted out. The two operations behind the presence gate are walked under
 //!   root with the gate stubbed (above), on every platform.
 //! - `Suite::required_on_mutating()` (conformance 0.8, `REQUIRED`). By default the
 //!   check drops required inputs from `Source`/`Exists` only: there it drops generate's
-//!   `into` (the `urn:secret` Source and Exists take only the `{name}` binding, not by
+//!   `into` (the `secret` Source and Exists take only the `{name}` binding, not by
 //!   value, and unlock takes none). Declaring it holds the Sink too: `content` is dropped
 //!   from the pipeline probe's firing and must be a typed `MissingArgument`. The kernel is
 //!   the scratch file store, so a wrongly accepted drop could only write there, and the
 //!   endpoint refuses before the keystore is consulted (the footprint in [`conforms`] is
 //!   unchanged). A clean report proves the declaration reached a Sink: an unreached one is
 //!   a `DECLARATIONS` finding. The Delete takes only the binding, so nothing is dropped.
-//! - `urn:secret`'s `Delete` (ledger #202) declares no `content`, so the suite fires it
+//! - `secret`'s `Delete` (ledger #202) declares no `content`, so the suite fires it
 //!   only under no grants (ENFORCED), never under root: the walk deletes nothing, and never
 //!   reaches the presence gate a `Delete` asks.
 //!
@@ -105,7 +102,7 @@ use ikigai_secret::{Backend, FileBackend, PresenceGate, GENERATE_IRI, UNLOCK_IRI
 use std::sync::{Arc, Mutex};
 
 /// The three descriptions `space()` binds, by id, with the IRI each is bound at.
-const SECRET: &str = "urn:secret";
+const SECRET: &str = "secret";
 const UNLOCK: &str = "secret-unlock";
 const GENERATE: &str = "secret-generate";
 const SECRET_TEMPLATE: &str = "urn:secret:{name}";
@@ -256,16 +253,16 @@ const SPACE_LABEL: &str = "ikigai_secret::space_with_gate(backend, gate)";
 const PLAIN_SPACE_LABEL: &str = "ikigai_secret::space(backend)";
 const DEFAULT_SPACE_LABEL: &str = "ikigai_secret::default_space()";
 
-/// The suite for this module: the seeded name bound on every verb of `urn:secret`
+/// The suite for this module: the seeded name bound on every verb of `secret`
 /// (a fixture per verb, so the intent survives a suite that looks bindings up per
-/// action), `urn:secret` declared live, NAMES dropped (wave two), REQUIRED held on
+/// action), `secret` declared live, every check run, REQUIRED held on
 /// the Sink too, and the three space constructors declared host-named
 /// (`space_with_gate` as the instance the kernel walks; `space` over a scratch store it
 /// never touches) — see the file docs. Nothing is opted out.
 fn suite(space: Arc<EndpointSpace>, scratch: &std::path::Path) -> Suite {
     let plain = ikigai_secret::space(Arc::new(FileBackend::new(scratch.join("never-walked"))));
     Suite::new()
-        .checks(Checks::all() - Checks::NAMES)
+        .checks(Checks::all())
         .live(SECRET)
         .required_on_mutating()
         .fixture(Fixture::new(SECRET, Verb::Source).binding("name", NAME))
@@ -277,16 +274,16 @@ fn suite(space: Arc<EndpointSpace>, scratch: &std::path::Path) -> Suite {
         .host_named_space(DEFAULT_SPACE_LABEL, ikigai_secret::default_space())
 }
 
-/// The walk saw three endpoints and six actions (`urn:secret` Source + Sink + Exists +
-/// Delete, one Source each for unlock and generate), skipped exactly NAMES, and opted out
+/// The walk saw three endpoints and six actions (`secret` Source + Sink + Exists +
+/// Delete, one Source each for unlock and generate), skipped no check, and opted out
 /// nothing. A fourth endpoint bound without a line here is held to a weaker standard.
 fn assert_shape(report: &Report) {
     assert_eq!(report.endpoints, 3, "{report}");
     assert_eq!(report.actions, 6, "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
-        vec![Check::Names],
-        "only NAMES is skipped: {report}"
+        Vec::<Check>::new(),
+        "no check is skipped: {report}"
     );
     assert!(report.declared.opted_out.is_empty(), "{report}");
     assert!(report.declared.pure.is_empty(), "{report}");
@@ -616,7 +613,7 @@ fn declared_outputs(kernel: &Kernel, pattern: &str) -> Vec<Vec<String>> {
 
 /// What `ikigai-conformance` 0.1.0 does not check (PENDING #11/#31): a declared
 /// output that is not an RDF face is never compared with what the action serves.
-/// Read by hand, then pinned: `urn:secret` serves bytes on Source and a
+/// Read by hand, then pinned: `urn:secret:{name}` serves bytes on Source and a
 /// `text/plain` answer on Sink, Exists and Delete; unlock serves `text/plain`; generate
 /// serves the PEM public key for `ed25519` and the `text/plain` recipient for `age` — two
 /// declared outputs, each served by one `type`. The gated operations are fired through
@@ -720,23 +717,24 @@ fn the_manifold_carries_no_secret() {
     );
 }
 
-/// The one finding the wave-two rename will flip: `urn:secret` is a full-IRI id
-/// (and a live MCP tool name); the two endpoints born in this wave are kebab-case.
+/// Ledger #11: every id is a kebab-case noun. NAMES alone reports nothing, and the three
+/// ids the manifold carries are exactly `secret`, `secret-unlock` and `secret-generate`
+/// (the first was the full IRI `urn:secret` before the naming wave).
 #[test]
-fn names_are_wave_two() {
+fn names_conform() {
     let (kernel, backend, _dir) = fixture();
     let report = Suite::new().checks(Checks::NAMES).run_blocking(&kernel);
-    let flagged: Vec<&str> = report
-        .of(Check::Names)
-        .map(|f| f.endpoint.as_str())
-        .collect();
-    assert_eq!(flagged, [SECRET], "{report}");
-    assert_eq!(report.findings.len(), 1, "{report}");
+    assert!(report.is_clean(), "{report}");
     assert_eq!(report.endpoints, 3, "{report}");
+    let ids: Vec<String> = [SECRET_TEMPLATE, UNLOCK_IRI, GENERATE_IRI]
+        .iter()
+        .map(|pattern| kernel.describe_pattern(pattern).unwrap().id)
+        .collect();
+    assert_eq!(ids, [SECRET, UNLOCK, GENERATE]);
     assert!(backend.ops().is_empty(), "NAMES is a static check");
 }
 
-/// The contract as the manifold states it: `urn:secret` has a Source and an Exists
+/// The contract as the manifold states it: `secret` has a Source and an Exists
 /// under the read wildcard, a Sink under the write wildcard and a Delete under the delete
 /// wildcard, each binding `name`, the Sink requiring `content`; unlock one Source under its own exact capability;
 /// generate one Source under its own capability AND the write wildcard (it writes

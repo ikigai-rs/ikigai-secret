@@ -574,15 +574,15 @@ impl Endpoint for SecretEndpoint {
     }
 
     fn describe(&self) -> Description {
-        // The id `urn:secret` predates the kebab-case convention and is a live MCP tool
-        // name; it is renamed in the coordinated wave-two pass, not here.
+        // The id is the resource name, `secret`: the same as `name()`, so the catalog, the
+        // MCP tool name and a conformance fixture all key on one name (ledger #11).
         let name = || {
             ArgSpec::new("name")
                 .summary("the secret's name (the `{name}` URI slot)")
                 .class(XSD_STRING)
                 .binding()
         };
-        Description::new("urn:secret")
+        Description::new("secret")
             .summary(
                 "Read (Source), store (Sink), test for (Exists) or remove (Delete) a named secret \
                  in the OS keystore (macOS Keychain; a file store elsewhere), capability-gated PER \
@@ -1527,6 +1527,35 @@ mod tests {
     use super::*;
     use ikigai_core::{Capability, Request, Verb};
     use ikigai_resolve::Resolver;
+
+    /// Ledger #11: each endpoint has ONE name. The `Description` id (what the catalog and the
+    /// MCP tool name carry) equals `Endpoint::name()` (what a conformance fixture keys on), so
+    /// a fixture keyed by either reaches the same endpoint. `urn:secret` once diverged from
+    /// `secret` here, and a fixture keyed by the wrong one was silently ignored.
+    #[test]
+    fn each_endpoint_has_one_name() {
+        let backend: Arc<dyn Backend> = Arc::new(FileBackend::new("/nonexistent"));
+        let gate: Arc<dyn PresenceGate> = Arc::new(|_: &str| Ok(()));
+        let endpoints: [Box<dyn Endpoint>; 3] = [
+            Box::new(SecretEndpoint {
+                backend: backend.clone(),
+                gate: gate.clone(),
+            }),
+            Box::new(UnlockEndpoint { gate: gate.clone() }),
+            Box::new(GenerateEndpoint { backend, gate }),
+        ];
+        let names: Vec<(String, String)> = endpoints
+            .iter()
+            .map(|e| (e.name().to_owned(), e.describe().id))
+            .collect();
+        for (name, id) in &names {
+            assert_eq!(name, id, "describe().id agrees with name()");
+        }
+        assert_eq!(
+            names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["secret", "secret-unlock", "secret-generate"]
+        );
+    }
 
     // ---- the Enclave wire-form converters, validated against p256's canonical encodings ----
     // (The Enclave itself only runs on real hardware; these are the fiddly bits that don't.)
