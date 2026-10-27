@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -11,9 +11,11 @@ keywords = ["ikigai", "roc", "secret", "keychain", "capability"]
 categories = ["os"]
 
 [dependencies]
-# The kernel: Endpoint/Space/Capability/Error, and `config::data_home_from` (0.1.58; 0.1.57 was
-# never published) for the file store's default directory.
-ikigai-core = "0.1.58"
+# The kernel: Endpoint/Space/Capability/Error, and `config::data_home_from` for the file store's
+# default directory. 0.2.0 is the streams release (ledger #2261); the old "0.1.58" pin meant
+# <0.2.0 under 0.x caret rules, so it could not reach it. "0.2.0" is a caret floor that admits
+# every 0.2.x and is in turn a ceiling below 0.3.
+ikigai-core = "0.2.0"
 # Endpoint::invoke is async (dyn via async-trait).
 async-trait = "0.1"
 
@@ -50,21 +52,17 @@ robius-authentication = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-# Resolver::issue_as drives the capability-gating test. 0.1.28 is the floor that builds
-# against the ikigai-core conformance pulls in (0.1.89+ since 0.6; 0.1.101+ under 0.8,
-# through its vocab pin): 0.1.27 and below construct core's `Resolved` by struct literal,
-# which core's levels fields (private) refuse. Re-checked against core 0.1.102 for 0.8.
-ikigai-resolve = "0.1.28"
+# Resolver::issue_as drives the capability-gating test. 0.2.0 is the first ikigai-resolve on
+# ikigai-core 0.2 (the streams release, ledger #2261); a 0.1.x resolve links core 0.1 and would
+# put a second core in the test build.
+ikigai-resolve = "0.2.0"
 futures = "0.3"
 tempfile = "3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
-# reports every violation at once. 0.8.0 is the newest published (VALIDATE from 0.7, REQUIRED
-# and `Checks::STATIC` from 0.8). Under 0.x caret rules this pin is a CEILING too: "0.8.0"
-# means <0.9.0, so a 0.9 needs a deliberate bump here. Its own floor on ikigai-core
-# (0.1.100, and 0.1.101 through its ikigai-vocab pin) is far above the library's,
-# and it pulls that core into every test build; `[dependencies] ikigai-core` is NOT raised
-# to match, because the library's pin states the true minimum of the API the LIBRARY uses.
-ikigai-conformance = "0.8.0"
+# reports every violation at once. 0.11.0 is the newest published and the first on ikigai-core
+# 0.2 (ledger #2261); it turns on DATATYPES and FAILURES by default. Under 0.x caret rules this
+# pin is a CEILING too: "0.11.0" means <0.12.0, so a 0.12 needs a deliberate bump here.
+ikigai-conformance = "0.11.0"
 # Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
 # canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

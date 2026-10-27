@@ -224,6 +224,19 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
 
+## 0.3.0 (unreleased)
+
+Moves onto ikigai-core 0.2, the streams release (ledger #2261, #2355). Core's types are in
+this crate's API (`Endpoint`, `EndpointSpace`, `Error`), so a consumer must be on core 0.2
+too: a breaking change under 0.x, so the release is a minor bump. No code changed: core 0.2
+builds this crate as it was.
+
+- `ikigai-core` `"0.1.58"` → `"0.2.0"`. The old pin meant `<0.2.0` under 0.x caret rules.
+- Dev-dependencies: `ikigai-resolve` `"0.1.28"` → `"0.2.0"` (the first on core 0.2) and
+  `ikigai-conformance` `"0.8.0"` → `"0.11.0"`. The conformance walk now also runs DATATYPES
+  and FAILURES, and passes both: `secret` has no Turtle face and states no failure classes,
+  so neither has anything to judge yet.
+
 ## Next slices
 
 - Key rotation under a capability.
