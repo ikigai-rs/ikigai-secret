@@ -269,9 +269,10 @@ fn suite(space: Arc<EndpointSpace>, scratch: &std::path::Path) -> Suite {
         .fixture(Fixture::new(SECRET, Verb::Sink).binding("name", NAME))
         .fixture(Fixture::new(SECRET, Verb::Exists).binding("name", NAME))
         .fixture(Fixture::new(SECRET, Verb::Delete).binding("name", NAME))
-        .host_named_space(SPACE_LABEL, space)
+        .host_named_space(SPACE_LABEL, space.clone())
         .host_named_space(PLAIN_SPACE_LABEL, plain)
         .host_named_space(DEFAULT_SPACE_LABEL, ikigai_secret::default_space())
+        .body_space(space)
 }
 
 /// The walk saw three endpoints and six actions (`secret` Source + Sink + Exists +

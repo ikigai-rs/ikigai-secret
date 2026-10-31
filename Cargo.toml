@@ -59,10 +59,12 @@ ikigai-resolve = "0.2.0"
 futures = "0.3"
 tempfile = "3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
-# reports every violation at once. 0.11.0 is the newest published and the first on ikigai-core
-# 0.2 (ledger #2261); it turns on DATATYPES and FAILURES by default. Under 0.x caret rules this
-# pin is a CEILING too: "0.11.0" means <0.12.0, so a 0.12 needs a deliberate bump here.
-ikigai-conformance = "0.11.0"
+# reports every violation at once. 0.12.0 adds BODIES (the buffered and body faces of an action
+# agree; probed through `Suite::body_space`) and BODY-INPUTS (an argument declared `reads_body`
+# takes inline, reference, stored and attached forms alike; nothing here declares one), both on by
+# default (ledger #2587). 0.11.0 (ledger #2261) turned on DATATYPES and FAILURES. Under 0.x caret
+# rules this pin is a CEILING too: "0.12.0" means <0.13.0, so a 0.13 needs a deliberate bump here.
+ikigai-conformance = "0.12.0"
 # Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
 # canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
