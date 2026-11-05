@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -12,10 +12,11 @@ categories = ["os"]
 
 [dependencies]
 # The kernel: Endpoint/Space/Capability/Error, and `config::data_home_from` for the file store's
-# default directory. 0.2.0 is the streams release (ledger #2261); the old "0.1.58" pin meant
-# <0.2.0 under 0.x caret rules, so it could not reach it. "0.2.0" is a caret floor that admits
-# every 0.2.x and is in turn a ceiling below 0.3.
-ikigai-core = "0.2.0"
+# default directory. 0.3.0 is the scoped content store (ledger #2965): held content is scoped
+# to whoever delivered it, and ContentStore::put/put_replay are root-only. This crate calls
+# neither, so it needed no source change. Before it, 0.2.0 was the streams release (ledger
+# #2261). ⚠ "0.3.0" is a caret floor that admits every 0.3.x and a CEILING below 0.4.
+ikigai-core = "0.3.0"
 # Endpoint::invoke is async (dyn via async-trait).
 async-trait = "0.1"
 
@@ -52,10 +53,10 @@ robius-authentication = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
-# Resolver::issue_as drives the capability-gating test. 0.2.0 is the first ikigai-resolve on
-# ikigai-core 0.2 (the streams release, ledger #2261); a 0.1.x resolve links core 0.1 and would
-# put a second core in the test build.
-ikigai-resolve = "0.2.0"
+# Resolver::issue_as drives the capability-gating test. 0.3.0 is the first ikigai-resolve on
+# ikigai-core 0.3 (ledger #3061); an older resolve links an older core and would put a second
+# core in the test build. ⚠ `^0.3.0` is a CEILING too (<0.4.0).
+ikigai-resolve = "0.3.0"
 futures = "0.3"
 tempfile = "3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
@@ -63,8 +64,10 @@ tempfile = "3"
 # agree; probed through `Suite::body_space`) and BODY-INPUTS (an argument declared `reads_body`
 # takes inline, reference, stored and attached forms alike; nothing here declares one), both on by
 # default (ledger #2587). 0.11.0 (ledger #2261) turned on DATATYPES and FAILURES. Under 0.x caret
-# rules this pin is a CEILING too: "0.12.0" means <0.13.0, so a 0.13 needs a deliberate bump here.
-ikigai-conformance = "0.12.0"
+# rules this pin is a CEILING too: "0.14.0" means <0.15.0, so a 0.15 needs a deliberate bump here.
+# 0.14.0 is the release on ikigai-core 0.3.0 (ledger #2965), so the test build links one core;
+# 0.13.0 added the `race` probes, which run by default.
+ikigai-conformance = "0.14.0"
 # Test-only: round-trip the Enclave wire-form converters (DER↔r‖s, point↔SPKI) against p256's
 # canonical encodings. A dev-dependency, so it never reaches the published crate or the wasm lib.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
