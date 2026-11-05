@@ -224,7 +224,18 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
 
-## 0.3.0 (unreleased)
+## 0.4.0 (unreleased)
+
+Moves onto ikigai-core 0.3, the scoped content store (ledger #2965): held content is scoped to
+whoever delivered it, and `ContentStore::put`/`put_replay` are root-only. This crate calls
+neither, so no code changed. Core's types are in this crate's API, so the release is a minor
+bump.
+
+- `ikigai-core` `"0.2.0"` → `"0.3.0"`.
+- Dev-dependencies: `ikigai-resolve` `"0.2.0"` → `"0.3.0"` (the first on core 0.3) and
+  `ikigai-conformance` `"0.12.0"` → `"0.14.0"`.
+
+## 0.3.0
 
 Moves onto ikigai-core 0.2, the streams release (ledger #2261, #2355). Core's types are in
 this crate's API (`Endpoint`, `EndpointSpace`, `Error`), so a consumer must be on core 0.2
