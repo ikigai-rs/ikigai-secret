@@ -125,6 +125,7 @@ enum Op {
     Delete(String),
     Exists(String),
     Replace(String),
+    Create(String),
     /// The presence gate was asked, with this reason.
     Presence(String),
 }
@@ -146,9 +147,12 @@ impl Recording {
         self.ops()
             .into_iter()
             .filter(|op| match op {
-                Op::Get(n) | Op::Set(n) | Op::Delete(n) | Op::Exists(n) | Op::Replace(n) => {
-                    n == name
-                }
+                Op::Get(n)
+                | Op::Set(n)
+                | Op::Delete(n)
+                | Op::Exists(n)
+                | Op::Replace(n)
+                | Op::Create(n) => n == name,
                 Op::Presence(_) => false,
             })
             .collect()
@@ -190,6 +194,10 @@ impl Backend for Recording {
     fn replace(&self, name: &str, value: &[u8]) -> ikigai_core::Result<()> {
         self.log.lock().unwrap().push(Op::Replace(name.into()));
         self.inner.replace(name, value)
+    }
+    fn create(&self, name: &str, value: &[u8]) -> ikigai_core::Result<bool> {
+        self.log.lock().unwrap().push(Op::Create(name.into()));
+        self.inner.create(name, value)
     }
 }
 
@@ -341,13 +349,14 @@ fn conforms() {
         "the pipeline probe's Sink landed"
     );
     // Generate's minimal call (`into=x`) checked that neither name held a secret
-    // (generate never replaces), asked for presence, then minted the pair; unlock asked
+    // (generate never replaces), asked for presence, then minted the pair, each half created
+    // only if its name is still free (ledger #3499); unlock asked
     // for presence. On every platform: the gate is the stub, never a Touch ID prompt.
     let minted: Vec<Op> = backend
         .ops()
         .into_iter()
         .filter(|op| match op {
-            Op::Set(n) | Op::Exists(n) => n == "x" || n == "x.pub",
+            Op::Set(n) | Op::Exists(n) | Op::Create(n) => n == "x" || n == "x.pub",
             Op::Presence(_) => true,
             _ => false,
         })
@@ -359,8 +368,8 @@ fn conforms() {
             Op::Exists("x".into()),
             Op::Exists("x.pub".into()),
             Op::Presence("Generate signing key x".into()),
-            Op::Set("x".into()),
-            Op::Set("x.pub".into())
+            Op::Create("x".into()),
+            Op::Create("x.pub".into())
         ]
     );
     assert_eq!(
@@ -911,8 +920,8 @@ fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
             Op::Exists("k".into()),
             Op::Exists("k.pub".into()),
             Op::Presence("Generate signing key k".into()),
-            Op::Set("k".into()),
-            Op::Set("k.pub".into()),
+            Op::Create("k".into()),
+            Op::Create("k.pub".into()),
             Op::Exists(NAME.into()),
         ],
         "asked after the checks, before the store; not at all for a refused name"

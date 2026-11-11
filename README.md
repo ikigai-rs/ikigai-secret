@@ -40,7 +40,10 @@ never inlined, never cached.
   needs `urn:cap:secret:generate` AND the write scope for both names it writes
   (`urn:cap:secret:write:<name>` and `urn:cap:secret:write:<name>.pub`); it never replaces
   a stored secret (a name holding either half is refused, before the prompt: rotating a key
-  is minting a new name) and never mints into a reserved name (`unlock`, `generate`). If the
+  is minting a new name; and each half is written through `Backend::create`, which stores
+  only into a free name, so a secret stored after that check is not replaced either, and two
+  generates racing for one name mint once) and never mints into a reserved name (`unlock`,
+  `generate`). If the
   public half cannot be written, the private half is removed again, so a failure never leaves
   half a pair. The private half is stored under `<name>`, the public half under `<name>.pub`, and the op
   returns the public half; the private key never leaves through this op (retrieved separately
@@ -136,6 +139,12 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
 - **Writes are atomic.** A write goes to a `0600` temporary file in the store, is synced,
   and is renamed over the old file, so a failed write (a full disk, a quota) leaves the
   previous secret intact and no partial value.
+- **Creating is exclusive.** `create` (what generate writes each half with) writes the value
+  to a `0600` temporary file the same way, then HARD-LINKS it to the secret's name, which the
+  filesystem refuses when the name is taken: the name appears only once the whole value is on
+  disk, and of several writers racing for one name exactly one stores. (So the store needs a
+  filesystem with hard links, as every home directory volume has; on one without, `create`
+  refuses with the error rather than falling back to a check-then-write.)
 - **Migrating a store from 0.1.6 or earlier.** A name made only of the verbatim set (every
   name the ecosystem uses today: `cms-passkeys`, `zotero-api-key`, `brian.sign.pub`) keeps
   the file name it always had and reads unchanged. Earlier versions mapped every other
@@ -224,7 +233,27 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
 
-## 0.4.0 (unreleased)
+## Unreleased
+
+Fixes from the second unled audit (ledger #3499). **Version call: a patch, 0.4.1**: one trait
+method with a default, and one behavior change that only tightens a stated promise.
+
+- **Generate's "never replaces" was a check-then-act.** It asked whether either name held a
+  secret, then wrote each half with `set`, which replaces. A secret stored between the check
+  and the write (a Sink by a holder of that name's write scope) was overwritten by a fresh
+  private key, and two generates into one name both passed the check and both answered with
+  a public half, though only one pair survived on disk. The other caller held an `age`
+  recipient (or a verifying key) whose private half was gone, so anything encrypted to it
+  could never be decrypted. Generate now writes each half through the new
+  **`Backend::create`** (store only if the name is free; `Ok(false)` when taken), and a name
+  taken meanwhile is refused as the up-front check refuses it. `tests/audit_3499.rs`.
+- **`Backend::create`**: the file store creates exclusively (a hard link, above). The
+  default, which the Keychain backend still uses, is `exists` then `set` and is no better
+  than before; a Keychain override (`SecItemAdd` refuses a duplicate on its own) needs the
+  machine to test. ⚠ A backend that WRAPS another (a recorder, a throttle) must forward
+  `create`, or it gets that default.
+
+## 0.4.0
 
 Moves onto ikigai-core 0.3, the scoped content store (ledger #2965): held content is scoped to
 whoever delivered it, and `ContentStore::put`/`put_replay` are root-only. This crate calls

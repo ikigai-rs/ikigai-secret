@@ -18,7 +18,8 @@
 //!   by `ikigai-encrypt`) — storing the private half under `<name>` and the public half
 //!   under `<name>.pub`, and returning the public half. Cap-gated (`urn:cap:secret:generate`
 //!   AND the write scope of both names it writes) and biometric-gated; it never replaces a
-//!   stored secret nor mints into a reserved name, and never leaves half a pair. The private
+//!   stored secret (each half is written through [`Backend::create`], which stores only into
+//!   a free name) nor mints into a reserved name, and never leaves half a pair. The private
 //!   key never leaves through this op (retrieved separately through the cap-gated read face).
 //!   One identity, two keys: sign *and* encrypt.
 //!
@@ -88,6 +89,23 @@ pub trait Backend: Send + Sync {
     fn replace(&self, name: &str, value: &[u8]) -> Result<()> {
         self.delete(name)?;
         self.set(name, value)
+    }
+
+    /// Store `value` under `name` only if `name` holds nothing: `Ok(true)` when stored,
+    /// `Ok(false)` when a secret is already there (nothing is changed). What
+    /// `urn:secret:generate` writes each half with, so it never replaces a stored secret.
+    ///
+    /// The default asks [`exists`](Backend::exists), then [`set`](Backend::set), which is
+    /// **not atomic**: a write that lands between the two is replaced, and two callers racing
+    /// for one name can both store. A backend that can create exclusively overrides it —
+    /// [`FileBackend`] writes a temporary file and hard-links it to the name, which the
+    /// filesystem refuses when the name is taken.
+    fn create(&self, name: &str, value: &[u8]) -> Result<bool> {
+        if self.exists(name)? {
+            return Ok(false);
+        }
+        self.set(name, value)?;
+        Ok(true)
     }
 
     /// **Sign-through**: sign `message` with the key named `name` WITHOUT extracting the private
@@ -694,9 +712,12 @@ struct GenerateEndpoint {
 }
 
 impl GenerateEndpoint {
-    /// Store a freshly minted pair under two names that held nothing, so that a failure can
-    /// never leave half of it: if the public half cannot be written, the private half is
-    /// removed again (it was new, so removing it loses nothing).
+    /// Store a freshly minted pair under two names that hold nothing, each through
+    /// [`Backend::create`], so a secret stored since the up-front check is never replaced and
+    /// two generates racing for one name cannot both mint (each would otherwise hand its caller
+    /// a public half whose private half the other had overwritten). A failure can never leave
+    /// half of it: if the public half cannot be created, the private half is removed again (it
+    /// was created here, so removing it loses nothing).
     fn store_pair(
         &self,
         key: &str,
@@ -704,21 +725,38 @@ impl GenerateEndpoint {
         private: &[u8],
         public_half: &[u8],
     ) -> Result<()> {
-        self.backend.set(key, private)?;
-        if let Err(e) = self.backend.set(public, public_half) {
-            return Err(match self.backend.delete(key) {
-                Ok(()) => Error::Endpoint(format!(
-                    "generate stored nothing: writing `{public}` failed ({e}), so the private \
-                     half `{key}` was removed again"
-                )),
-                Err(undo) => Error::Endpoint(format!(
-                    "generate failed writing `{public}` ({e}) and could not remove the private \
-                     half `{key}` ({undo}): `{key}` holds a private key with no public half; \
-                     delete it at the box"
-                )),
-            });
+        if !self.backend.create(key, private)? {
+            return Err(already_holds(key));
         }
-        Ok(())
+        let failure = match self.backend.create(public, public_half) {
+            Ok(true) => return Ok(()),
+            Ok(false) => already_holds(public),
+            Err(e) => e,
+        };
+        Err(match self.backend.delete(key) {
+            // Taken meanwhile: the same answer the up-front check gives.
+            Ok(()) if matches!(failure, Error::InvalidArgument { .. }) => failure,
+            Ok(()) => Error::Endpoint(format!(
+                "generate stored nothing: writing `{public}` failed ({failure}), so the private \
+                 half `{key}` was removed again"
+            )),
+            Err(undo) => Error::Endpoint(format!(
+                "generate failed writing `{public}` ({failure}) and could not remove the private \
+                 half `{key}` ({undo}): `{key}` holds a private key with no public half; \
+                 delete it at the box"
+            )),
+        })
+    }
+}
+
+/// Generate's refusal of a name that already holds a secret.
+fn already_holds(name: &str) -> Error {
+    Error::InvalidArgument {
+        name: "into".into(),
+        detail: format!(
+            "`{name}` already holds a secret, and generate never replaces one; mint into a new \
+             name"
+        ),
     }
 }
 
@@ -778,15 +816,11 @@ impl Endpoint for GenerateEndpoint {
         }
         // And it never replaces: a name already holding either half is refused, before the
         // biometric prompt. Rotating a key is minting a new name.
+        // (The check that settles it is the exclusive create in `store_pair`; this one only
+        // spares the person a prompt for a name that is already taken.)
         for name in [&key, &public] {
             if self.backend.exists(name)? {
-                return Err(Error::InvalidArgument {
-                    name: "into".into(),
-                    detail: format!(
-                        "`{name}` already holds a secret, and generate never replaces one; \
-                         mint into a new name"
-                    ),
-                });
+                return Err(already_holds(name));
             }
         }
         // Private key → `<name>`; public key → `<name>.pub`; the endpoint returns the
