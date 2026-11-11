@@ -45,7 +45,9 @@ use crate::{refuse_deny_shaped, Backend};
 /// another user, is refused: its contents are not trusted, and tightening it would trust
 /// whatever was written. **Writes are atomic**: a `set` writes a `0600` temporary file in the
 /// store, syncs it and renames it over the old one, so a failed write leaves the previous
-/// secret intact.
+/// secret intact. **Creating is exclusive**: [`create`](Backend::create) writes the same
+/// temporary file and hard-links it to the name, which the filesystem refuses when the name
+/// is taken, so of several writers racing for one name exactly one stores.
 pub struct FileBackend {
     /// The store directory, or why there is none: every operation then refuses with it.
     pub(crate) dir: std::result::Result<PathBuf, String>,
@@ -230,10 +232,9 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     check_dir(dir).map(|_| ())
 }
 
-/// Write `value` to `target` whole: a private temporary file in the store, synced, renamed
-/// over the target. A failure at any point leaves the previous file (or none) and no partial
-/// one; the temporary file is removed.
-fn write_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<()> {
+/// Write `value` whole to a fresh private temporary file in the store, synced and closed,
+/// and return its path. Hidden, so never a secret's file name. A failure removes it.
+fn write_temp(dir: &Path, value: &[u8]) -> Result<PathBuf> {
     use rand_core::RngCore;
     use std::io::Write;
     let fail = |e: std::io::Error| Error::Endpoint(format!("secret write: {e}"));
@@ -259,19 +260,54 @@ fn write_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<()> {
     let written = (|| {
         modes::set_file(&file, modes::FILE)?;
         file.write_all(value)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, target)
+        file.sync_all()
     })();
+    drop(file);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(fail(e));
     }
-    // The rename's own durability, best-effort: not every platform can open a directory.
+    Ok(tmp)
+}
+
+/// The rename's (or link's) own durability, best-effort: not every platform can open a
+/// directory.
+fn sync_dir(dir: &Path) {
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();
     }
+}
+
+/// Write `value` to `target` whole: a private temporary file in the store, synced, renamed
+/// over the target. A failure at any point leaves the previous file (or none) and no partial
+/// one; the temporary file is removed.
+fn write_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<()> {
+    let tmp = write_temp(dir, value)?;
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Endpoint(format!("secret write: {e}")));
+    }
+    sync_dir(dir);
     Ok(())
+}
+
+/// Write `value` to `target` whole, only if `target` does not exist: a private temporary
+/// file in the store, synced, then HARD-LINKED to the target name, which the filesystem
+/// refuses atomically when the name is taken (`Ok(false)`, nothing changed). Unlike a
+/// rename, a link never replaces, and unlike opening the target with `create_new`, the name
+/// appears only once the whole value is on disk. The temporary name is removed either way.
+fn create_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<bool> {
+    let tmp = write_temp(dir, value)?;
+    let linked = std::fs::hard_link(&tmp, target);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            sync_dir(dir);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::Endpoint(format!("secret create: {e}"))),
+    }
 }
 
 impl Backend for FileBackend {
@@ -347,6 +383,22 @@ impl Backend for FileBackend {
     /// replace never deletes first and a failure keeps the previous secret.
     fn replace(&self, name: &str, value: &[u8]) -> Result<()> {
         self.set(name, value)
+    }
+
+    /// Atomic: the whole value is written to a temporary file and hard-linked to the name,
+    /// which the filesystem refuses when the name is taken. Two writers racing for one name
+    /// cannot both create it, and a secret stored meanwhile is never replaced.
+    fn create(&self, name: &str, value: &[u8]) -> Result<bool> {
+        let (dir, file) = self.locate(name)?;
+        ensure_dir(dir)?;
+        let target = dir.join(&file);
+        let created = create_atomic(dir, &target, value)?;
+        // Taken: by this very name, or (on a volume that folds case) by a legacy entry that
+        // differs from it only in case, which is refused as everywhere else.
+        if !created && !exact_entry(dir, &file)? {
+            return Err(ambiguous(dir, &file));
+        }
+        Ok(created)
     }
 }
 
