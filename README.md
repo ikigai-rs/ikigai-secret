@@ -155,6 +155,10 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   that folds case. A secret stored under a name outside the verbatim set must be stored
   again.
 
+## Accessibility
+
+This library has no screens, but people meet its presence prompt and its error sentences. [ACCESSIBILITY.md](ACCESSIBILITY.md) says what is in scope, how it is tested, and the barriers we know about (the macOS presence gate accepts biometrics only, with no password fallback).
+
 ## 0.1.7 (2026-10-07)
 
 Fixes for audit round 3 (ledger #854, and #203). **Version call: a patch, 0.1.7.** The Rust
