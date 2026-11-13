@@ -53,11 +53,28 @@ be found.
 
 ## How it is tested
 
-- Every presence-gated operation runs headless in the test suite through an injected gate (any
-  `Fn(&str) -> Result<()>` closure is a gate), so the order of checks, a refused prompt and the
-  reason strings are exercised on every platform in CI.
-- **No assistive technology has been used** with the system prompt or with any host showing this
-  library's errors. The real Touch ID prompt is exercised only by hand, on a Mac.
+Every named check has a result: Pass, Fail or Blocked, with its evidence. A Pass covers only the
+stated check, not overall accessibility. Every Pass below was run on main at `792de1e` on
+2026-11-12 on macOS (arm64) with rustc and cargo 1.100.0: `cargo test --all-features`, 66 passed,
+0 failed, 3 ignored. CI runs the same tests on every pull request. Every presence-gated operation
+runs headless through an injected gate (any `Fn(&str) -> Result<()>` closure is a gate), so the
+tests exercise the order of checks and the reason strings without showing a real prompt.
+
+| Check | Result | Evidence |
+|---|---|---|
+| The presence prompt is asked last, after every capability and argument check, and its refusal stands | Pass | `cargo test`: `tests/conformance.rs` (`the_presence_gate_is_asked_last_and_its_refusal_stands`, `delete_asks_the_presence_gate_last`) and `src/lib.rs` (`unlock_is_capability_gated_before_the_presence_gate`). A person refused for a missing capability is never shown a prompt they cannot pass. |
+| Prompt reason text in words: "Unlock ikigai secrets", "Generate signing key {name}", "Delete secret {name}" | Pass | `cargo test`: `tests/conformance.rs` asserts each string the gate is asked with. Checks the text handed to the gate, not how the system dialog shows it. |
+| Prompt reason text "Generate encryption key {name}" | Blocked | In `src/lib.rs` (the `urn:secret:generate` endpoint), but no test asserts it. |
+| A refused secret name beginning with `-` names the argument and why | Pass | `cargo test`: `tests/deny_shaped_names.rs` (`the_read_face_refuses_a_name_beginning_with_dash`, `generate_refuses_into_beginning_with_dash` and the rest of the suite) checks the error kind and the argument it names. |
+| The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
+| A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
+| The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
+| Manual keyboard | Blocked | No person has completed the system prompt or a host's error display from the keyboard for this review. |
+| Screen reader | Blocked | No screen reader has been used with the system prompt or with a host showing this library's errors. |
+| Screen magnifier | Blocked | No screen magnifier has been used with this output. |
+| Speech input | Blocked | No speech-input software has been used with this output. |
+| Switch access | Blocked | No switch-access software has been used with this output. |
+| Braille display | Blocked | No braille display has been used with this output. |
 
 ## Known limitations
 
@@ -74,9 +91,22 @@ be found.
 - Error sentences follow no tested style guide yet; some name internal stores ("secret write: …")
   rather than saying what the person can do.
 
+## Contributing
+
+Read this file before changing the presence gate, a reason string or an error message. In the pull
+request, give each check a row in a Check | Result | Evidence table: Pass, Fail or Blocked, with
+the test or command, the tool and its version, or why it could not run. Keep an unrun check as
+Blocked, a screen reader nobody ran included; never omit it.
+
 ## Reporting a barrier
 
 Open [a GitHub issue](https://github.com/ikigai-rs/ikigai-secret/issues/new) describing what you
 tried, what happened, and what assistive technology or setting you use if any. We aim to
 acknowledge a report within 7 days. For anything security-sensitive, do not open a public issue:
 contact the maintainers privately first.
+
+## Change history
+
+| Date | Change |
+|---|---|
+| 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass run on main at `792de1e`; the two known barriers recorded as Fail rows. |
