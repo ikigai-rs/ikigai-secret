@@ -130,6 +130,9 @@ directly with `FileBackend::new(dir)`). Not hardware-backed.
   so distinct names stay distinct files on a volume that folds case (APFS, NTFS), and no name
   can address `.`, `..` or a hidden file. The store's own temporary files are hidden
   (`.tmp-…`).
+- **Only regular files.** A read refuses an entry that is a symlink, a FIFO, a directory or a
+  device: a symlink is never followed out of the store (nor is what it names `chmod`ed), and a
+  FIFO is refused at once rather than waited on.
 - **Modes (Unix).** The directory is `0700` and every file `0600`, set explicitly at
   creation, so the umask cannot widen them. An existing directory or file others can **read**
   is tightened to `0700`/`0600` and logged once on stderr (anything in it may already have
@@ -236,6 +239,15 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
+
+## 0.5.1
+
+A patch from the third unled audit (ledger #4023): the file store serves only regular files.
+
+- A read opens a secret's file without following a link at its name and without waiting on it,
+  and refuses any entry that is not a regular file (a symlink, a FIFO, a directory or a device)
+  with a sentence, before judging its mode or reading it. A symlinked store directory still
+  works. Regression tests: `tests/audit_4023.rs`.
 
 ## 0.5.0
 
