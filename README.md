@@ -237,10 +237,22 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
 
-## Unreleased
+## 0.5.0
 
-Fixes from the second unled audit (ledger #3499). **Version call: a patch, 0.4.1**: one trait
-method with a default, and one behavior change that only tightens a stated promise.
+Moves onto ikigai-core 0.4, scope opacity and structured denials (the core 0.4.0 cascade, ledger
+#3913). `Error::Denied` now carries a `Denial`; every refusal here builds one from the same
+sentence as before, so what a caller reads is unchanged. Core's types are in this crate's API, so
+the release is a minor bump, and it carries the unreleased audit fixes below (planned as 0.4.1,
+never published).
+
+- `ikigai-core` `"0.3.0"` → `"0.4.1"` (0.4.1 because the test build's `ikigai-resolve` 0.6.0
+  requires it).
+- Dev-dependencies: `ikigai-resolve` `"0.3.0"` → `"0.6.0"` and `ikigai-conformance` `"0.14.0"` →
+  `"0.15.0"`, their releases on core 0.4.
+- Tests that read a refusal's text read it through `Denial::message()`.
+
+Fixes from the second unled audit (ledger #3499), first planned as a patch: one trait method
+with a default, and one behavior change that only tightens a stated promise.
 
 - **Generate's "never replaces" was a check-then-act.** It asked whether either name held a
   secret, then wrote each half with `set`, which replaces. A secret stored between the check
