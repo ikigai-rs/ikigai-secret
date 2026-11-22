@@ -114,7 +114,7 @@ fn a_new_form_iri_already_resolves_with_the_proposed_scope_and_storage_key() {
     let other = scoped(&["urn:cap:secret:read:owner:id:other:name:deploy-token"]);
     let err = issue(&kernel, source(), &other).unwrap_err();
     assert!(
-        matches!(&err, Error::Denied(why) if why.contains(&format!("urn:cap:secret:read:{ACME_DEPLOY}"))),
+        matches!(&err, Error::Denied(why) if why.message().contains(&format!("urn:cap:secret:read:{ACME_DEPLOY}"))),
         "refused naming the exact scope: {err:?}"
     );
     assert_eq!(

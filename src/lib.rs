@@ -305,7 +305,7 @@ pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
 ///     Arc::new(FileBackend::new(dir.path())),
 ///     Arc::new(nobody),
 /// )));
-/// assert!(matches!(unlock(&kernel), Err(Error::Denied(why)) if why == "nobody at the machine"));
+/// assert!(matches!(unlock(&kernel), Err(Error::Denied(why)) if why.message() == "nobody at the machine"));
 ///
 /// // A gate that finds someone: unlocked.
 /// let present = |_reason: &str| Ok(());
@@ -399,7 +399,7 @@ pub fn require_biometric(reason: &str) -> Result<()> {
         };
         Context::new(())
             .blocking_authenticate(text, &policy)
-            .map_err(|e| Error::Denied(format!("biometric check failed: {e:?}")))
+            .map_err(|e| Error::Denied(format!("biometric check failed: {e:?}").into()))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -507,9 +507,9 @@ impl Endpoint for SecretEndpoint {
                 // (some grant under the prefix); this is the exact-name rule behind it.
                 let scope = format!("urn:cap:secret:read:{name}");
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
-                        "reading `{name}` requires `{scope}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("reading `{name}` requires `{scope}`").into(),
+                    ));
                 }
                 let bytes = self
                     .backend
@@ -527,9 +527,9 @@ impl Endpoint for SecretEndpoint {
             Verb::Sink => {
                 let scope = format!("urn:cap:secret:write:{name}");
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
-                        "writing `{name}` requires `{scope}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("writing `{name}` requires `{scope}`").into(),
+                    ));
                 }
                 // Any bytes: the read face serves `application/octet-stream`, so the write face
                 // takes exactly what it may hand back (a binary key, not only text).
@@ -551,9 +551,9 @@ impl Endpoint for SecretEndpoint {
             Verb::Exists => {
                 let scope = format!("urn:cap:secret:read:{name}");
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
-                        "asking whether `{name}` exists requires `{scope}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("asking whether `{name}` exists requires `{scope}`").into(),
+                    ));
                 }
                 let present = self.backend.exists(&name)?;
                 // Never cacheable, like the read: whether a secret exists is live.
@@ -568,9 +568,9 @@ impl Endpoint for SecretEndpoint {
             Verb::Delete => {
                 let scope = format!("urn:cap:secret:delete:{name}");
                 if !inv.capability.allows(&scope) {
-                    return Err(Error::Denied(format!(
-                        "deleting `{name}` requires `{scope}`"
-                    )));
+                    return Err(Error::Denied(
+                        format!("deleting `{name}` requires `{scope}`").into(),
+                    ));
                 }
                 // Then presence, after every capability and argument check (a refused caller
                 // never reaches the gate) and before the keystore: the gate's refusal is the
@@ -807,11 +807,14 @@ impl Endpoint for GenerateEndpoint {
         for name in [&key, &public] {
             let scope = format!("urn:cap:secret:write:{name}");
             if !inv.capability.allows(&scope) {
-                return Err(Error::Denied(format!(
-                    "generate into `{key}` writes `{key}` and `{public}`, so it requires \
+                return Err(Error::Denied(
+                    format!(
+                        "generate into `{key}` writes `{key}` and `{public}`, so it requires \
                      `urn:cap:secret:write:{key}` and `urn:cap:secret:write:{public}`; \
                      missing `{scope}`"
-                )));
+                    )
+                    .into(),
+                ));
             }
         }
         // And it never replaces: a name already holding either half is refused, before the

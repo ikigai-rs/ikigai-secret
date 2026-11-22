@@ -942,7 +942,7 @@ fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
     ] {
         let err = issue(&kernel, Verb::Source, iri, args, &root).unwrap_err();
         assert!(
-            matches!(&err, Error::Denied(why) if why == "nobody at the machine"),
+            matches!(&err, Error::Denied(why) if why.message() == "nobody at the machine"),
             "{iri}: {err:?}"
         );
     }
@@ -957,7 +957,7 @@ fn the_presence_gate_is_asked_last_and_its_refusal_stands() {
     for capability in [root.clone(), delete(NAME)] {
         let err = issue(&kernel, Verb::Delete, &secret_iri(NAME), &[], &capability).unwrap_err();
         assert!(
-            matches!(&err, Error::Denied(why) if why == "nobody at the machine"),
+            matches!(&err, Error::Denied(why) if why.message() == "nobody at the machine"),
             "delete: {err:?}"
         );
     }
