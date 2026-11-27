@@ -73,6 +73,10 @@ tempfile = "3"
 # Test-only: the `[secret]` section is deserialized from real TOML in the tests and doctests, as a
 # host would (`toml::from_str`). The library itself reads no TOML.
 toml = "0.8"
+# Test-only: `tests/fnox_plugin.rs` loads `contrib/fnox/ikigai.lua` into Lua 5.4 (the version
+# fnox's plugins target), built from source by `vendored` so CI needs no system Lua, beside a
+# stand-in for `fnox.cmd`. Never in the published library. ⚠ "0.12" is a CEILING too (<0.13).
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
 # reports every violation at once. 0.12.0 adds BODIES (the buffered and body faces of an action
 # agree; probed through `Suite::body_space`) and BODY-INPUTS (an argument declared `reads_body`
