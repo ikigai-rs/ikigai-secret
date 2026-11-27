@@ -2,7 +2,8 @@
 
 Design spike for ledger #3748 (fnox, both directions), widened to the ask behind it: configurable
 options for where secrets are stored, as soon as possible. Status: **decided** (Brian, 2026-11-27;
-section 9). Nothing here is built yet; section 10's tasks are filed.
+section 9). Section 10's task 1 (stores and routes) is built in 0.5.2 (ledger #4486); the
+rest are filed.
 
 References are to this repository at `b083c84` (0.5.1) and to fnox 1.50.0 (released 2026-11-18,
 MIT, <https://fnox.jdx.dev>, <https://github.com/jdx/fnox>). The fnox facts below were read from

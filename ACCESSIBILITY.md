@@ -18,8 +18,8 @@ Adapted from the [ACCESSIBILITY.md template](https://github.com/mgifford/ACCESSI
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-secret/issues/new) |
 | Target | WCAG 2.2 Level AA, applied to the text and prompts this library produces |
 | Status | Evaluation in progress. No conformance claim. |
-| Last reviewed | 2026-11-12 |
-| Next review | a change to the presence gate, to an error message, or to the platforms a gate supports |
+| Last reviewed | 2026-11-27 |
+| Next review | a change to the presence gate, to an error message, to the inspection text, or to the platforms a gate supports |
 
 ## Commitment
 
@@ -43,6 +43,12 @@ be found.
   values this library returns, which hosts may show to people (for example, why a secret name
   beginning with `-` is refused).
 - **Descriptions.** The endpoint descriptions (Meta) a host can render as help.
+- **Configuration refusals.** The sentences `SecretConfigError` carries when a host's `[secret]`
+  section is refused (since 0.5.2): one per problem, each naming the line, which a host prints
+  when it refuses to start.
+- **Inspection text.** The `text/plain` faces of `urn:secret:store`,
+  `urn:secret:store:name:{store}` and `urn:secret:route` (since 0.5.2): one sentence per store or
+  route. `urn:secret:route:secret:{name}` answers the bare store name, for scripts.
 
 ### Not ours to fix, still ours to report
 
@@ -66,11 +72,14 @@ tests exercise the order of checks and the reason strings without showing a real
 | Prompt reason text in words: "Unlock ikigai secrets", "Generate signing key {name}", "Delete secret {name}" | Pass | `cargo test`: `tests/conformance.rs` asserts each string the gate is asked with. Checks the text handed to the gate, not how the system dialog shows it. |
 | Prompt reason text "Generate encryption key {name}" | Blocked | In `src/lib.rs` (the `urn:secret:generate` endpoint), but no test asserts it. |
 | A refused secret name beginning with `-` names the argument and why | Pass | `cargo test`: `tests/deny_shaped_names.rs` (`the_read_face_refuses_a_name_beginning_with_dash`, `generate_refuses_into_beginning_with_dash` and the rest of the suite) checks the error kind and the argument it names. |
+| A refused `[secret]` section says, in one sentence per problem, which line is wrong and what to do | Pass | Run on the ledger #4486 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `cargo test`: 102 passed, 0 failed, 3 ignored. `src/store.rs` unit tests (`an_unknown_kind_is_refused_naming_the_line`, `a_route_to_an_unconfigured_store_is_refused`, `a_default_that_names_nothing_is_refused`, `two_routes_with_the_same_match_are_refused`, `mac_stores_are_refused_off_macos_and_accepted_on_it` and the rest) assert each sentence whole; `every_problem_is_reported_at_once_and_nothing_is_applied` asserts they are listed together. Checks the words, not how a host shows them. |
+| The inspection text faces are sentences in words, with no arrows or symbols standing for words | Pass | Same run: `tests/routed.rs` (`every_inspection_resource_answers_under_its_narrow_grant`) asserts the whole text of `urn:secret:store`, one store's lines and `urn:secret:route`. |
+| A write to a read-only store is refused with a sentence naming the store, before any presence prompt | Pass | Same run: `tests/routed.rs` (`a_read_only_store_refuses_writes_after_the_capability_and_before_presence`) asserts the sentence and that the gate was never asked. |
 | The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
 | A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
 | The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
 | Manual keyboard | Blocked | No person has completed the system prompt or a host's error display from the keyboard for this review. |
-| Screen reader | Blocked | No screen reader has been used with the system prompt or with a host showing this library's errors. |
+| Screen reader | Blocked | No screen reader has been used with the system prompt, with a host showing this library's errors, or with the inspection text. |
 | Screen magnifier | Blocked | No screen magnifier has been used with this output. |
 | Speech input | Blocked | No speech-input software has been used with this output. |
 | Switch access | Blocked | No switch-access software has been used with this output. |
@@ -110,3 +119,4 @@ contact the maintainers privately first.
 | Date | Change |
 |---|---|
 | 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass run on main at `792de1e`; the two known barriers recorded as Fail rows. |
+| 2026-11-27 | 0.5.2 (ledger #4486): the configuration refusals and the inspection text in scope, with three Pass rows run on that branch. |

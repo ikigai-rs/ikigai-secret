@@ -99,6 +99,12 @@ impl FileBackend {
         }
     }
 
+    /// A backend that refuses every operation with `why`: a store that cannot be built here.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn refusing(why: String) -> Self {
+        FileBackend { dir: Err(why) }
+    }
+
     fn dir(&self) -> Result<&Path> {
         self.dir
             .as_deref()
@@ -355,6 +361,23 @@ fn create_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<bool> {
 }
 
 impl Backend for FileBackend {
+    /// Whether the store directory can be reached, judged without reading any secret and
+    /// without naming the directory: `reachable`, `reachable, empty` (it is made on the first
+    /// write), or `unavailable` and why.
+    fn health(&self) -> String {
+        let Ok(dir) = &self.dir else {
+            return "unavailable: there is no store directory on this host".to_string();
+        };
+        match std::fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => "reachable".to_string(),
+            Ok(_) => "unavailable: the store's path is not a directory".to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "reachable, empty: the directory is made on the first write".to_string()
+            }
+            Err(_) => "unavailable: the store directory cannot be read".to_string(),
+        }
+    }
+
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
         use std::io::Read;
         let (dir, file) = self.locate(name)?;

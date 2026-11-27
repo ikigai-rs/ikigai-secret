@@ -111,6 +111,73 @@ prompt), and the test pins that the gate is asked only after every other check a
 refusal stands, for unlock, generate and a `Delete`. The `Delete` declares no `content`, so the
 suite fires it only under no grants: the walk deletes nothing and never reaches the gate.
 
+## Stores and routes
+
+Where a secret is stored is configuration (ledger #4486; the design is
+[`docs/storage-backends.md`](docs/storage-backends.md)). A host reads the `[secret]` section of
+its config home's `config.toml`, deserializes it into a `SecretSection` (serde, as core's
+`CacheConfig`), and hands it to `SecretConfig::from_section(section, home)`. This crate reads no
+file and no environment for it.
+
+```toml
+[secret]
+default = "keychain"            # the store every name no route matches goes to
+
+[secret.store.keychain]
+kind = "keychain"               # macOS only
+service = "ikigai-secret"       # the default
+
+[secret.store.local]
+kind = "file"
+path = "~/.ikigai/secrets"      # absolute, or under the home the host passes
+write = false                   # any store: refuse writes (default true)
+
+[[secret.route]]                # read in order; the first match wins
+match = "owner:id:acme:name:*"  # a glob on the full secret name (`*`, `?`, `[...]`)
+store = "local"
+```
+
+- **Kinds.** `keychain`, `secure-enclave` (both macOS only) and `file` are built here.
+  `age-file` and `fnox` are accepted kinds that are refused as "not built yet" until their own
+  tasks land. Each kind reads only its own settings: `keychain` reads `service`,
+  `secure-enclave` reads `label_prefix`, `file` reads `path`, and every kind reads `write`.
+- **Refused whole.** An unknown kind, a kind not built yet, a Mac store off macOS, a setting
+  of another kind, a store name that is not lowercase letters, digits, `-` and `_`, a missing
+  `default` or one that names no store, a route to a store that is not configured, a `match`
+  that is empty or not a glob, and two routes with the same `match`: each is one sentence
+  naming its line, all of them are reported at once, and nothing in a refused section is
+  applied. A host refuses to start on one; wiring that into the hosts is ledger #4487.
+- **One store per name.** `RoutingBackend` sends every call to the store its name routes to,
+  and only there: a miss is NotFound, never "try the next store". `sign` and
+  `generate_signing_key` route the same way.
+- **Routes never widen a scope.** Every face checks the name's own scope before the backend is
+  called, so a route only says where an allowed operation goes. A write to a name routed to a
+  store with `write = false` is refused as Conflict after the capability check and before the
+  presence gate.
+- **No section** is exactly today: one store, the one `default_backend()` builds (the Keychain
+  under `ikigai-secret` on a Mac, the file store in its usual place elsewhere), with no routes.
+- **Inspection.** `routed_space(routing)` (or `routed_space_with_gate`) mounts every face of
+  `space()` over the routing backend, plus four resources that never carry a path, an
+  account, a token or a value. Each answers `text/plain`, or `application/json` with
+  `as=application/json`:
+
+  | bound at | id | requires | answers | cached |
+  |---|---|---|---|---|
+  | `urn:secret:store` | `secret-store` | `urn:cap:secret:inspect` | each store's name, kind, whether it can be written, a sentence | until the config thread is cut |
+  | `urn:secret:store:name:{store}` | `secret-store-name` | `urn:cap:secret:inspect` | the same for one store, plus a health line read now | never |
+  | `urn:secret:route` | `secret-route` | `urn:cap:secret:inspect` | the ordered routes and the default | until the config thread is cut |
+  | `urn:secret:route:secret:{name}` | `secret-route-secret` | `urn:cap:secret:read:<name>` | the store `name` routes to, from the route table alone | until the config thread is cut |
+
+  A host that reloads its configuration cuts `CONFIG_THREAD` (`urn:secret:config`). In the
+  routed space the names `store` and `route`, and every name beginning `store:name:` or
+  `route:secret:`, belong to these resources, so generate refuses to mint into them.
+  `space(backend)` binds none of them and is unchanged.
+
+`tests/routed.rs` walks the routed space with `ikigai-conformance` and pins by hand: every
+resource under its narrow grant, every routed path refused under no grants and under grants for
+other names with no store and no gate touched, a route never widening a scope, a miss staying
+NotFound, read-only stores, and the no-section path forwarding every call unchanged.
+
 ## The file store
 
 `FileBackend` is the default off macOS (and what tests and the cms-web relying party build
@@ -239,6 +306,27 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
+
+## 0.5.2
+
+Stores and routes (ledger #4486), the first step of configurable secret storage (epic ledger
+#4485). Additive, so a patch: nothing a 0.5.1 host calls changes behavior.
+
+- `SecretSection`, `SecretConfig`, `SecretConfigError`, `StoreKind`, `StoreSpec`, `RouteSpec`,
+  `Routed` and `RoutingBackend`: the `[secret]` section, its refusals and the routing backend
+  (see "Stores and routes", above).
+- `routed_space` and `routed_space_with_gate`, with the four inspection resources under the
+  new `urn:cap:secret:inspect` (and `urn:cap:secret:read:<name>` for where a name lives).
+- Two `Backend` methods with defaults: `accepts_writes` (asked after the capability check and
+  before the presence gate; the faces call it before a Sink, a Delete and a generate) and
+  `health` (one line for `urn:secret:store:name:{store}`; the file store judges its directory).
+  ⚠ A backend that wraps another should forward both.
+- `default_backend()` is now built through the same function as the no-section configuration;
+  what it builds is unchanged.
+- The `secret` endpoint's summary says "the store its name routes to" rather than naming the
+  OS keystore.
+- New dependencies: `serde` (the section is `Deserialize`), `serde_json` (the JSON faces) and
+  `glob` (a route's `match`); `toml` for tests only.
 
 ## 0.5.1
 
