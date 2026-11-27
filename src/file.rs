@@ -48,6 +48,11 @@ use crate::{refuse_deny_shaped, Backend};
 /// secret intact. **Creating is exclusive**: [`create`](Backend::create) writes the same
 /// temporary file and hard-links it to the name, which the filesystem refuses when the name
 /// is taken, so of several writers racing for one name exactly one stores.
+///
+/// **Only regular files are secrets.** A read refuses an entry that is a symlink (it is never
+/// followed out of the store, and what it names is never `chmod`ed), a FIFO (refused at once,
+/// never waited on), a directory or a device. Such an entry still occupies its name: `exists`
+/// answers `true` and `create` refuses it, while a `set` renames a regular file over it.
 pub struct FileBackend {
     /// The store directory, or why there is none: every operation then refuses with it.
     pub(crate) dir: std::result::Result<PathBuf, String>,
@@ -270,6 +275,45 @@ fn write_temp(dir: &Path, value: &[u8]) -> Result<PathBuf> {
     Ok(tmp)
 }
 
+/// Open a secret's file for reading WITHOUT following a symlink at its name, and without
+/// waiting on a FIFO. Unix: `O_NOFOLLOW` makes a symlink entry fail the open (`ELOOP`) instead
+/// of opening whatever it names outside the store, and `O_NONBLOCK` makes a FIFO open at once,
+/// so the caller's regular-file check refuses it instead of blocking for a writer. On a regular
+/// file `O_NONBLOCK` changes nothing about a read. Elsewhere a plain open.
+fn open_entry(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    options.open(path)
+}
+
+/// Whether an open failed because its name is a symlink and `O_NOFOLLOW` refused it.
+fn is_symlink_refusal(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The refusal for an entry that is not a regular file: a symlink, a FIFO, a directory.
+fn not_a_regular_file(path: &Path) -> Error {
+    Error::Endpoint(format!(
+        "the secrets store entry {} is not a regular file (a symlink, a FIFO, a directory or a \
+         device), and the store serves only regular files, never what a link names outside it; \
+         inspect it at the box, then replace it with the secret's bytes or remove it",
+        path.display()
+    ))
+}
+
 /// The rename's (or link's) own durability, best-effort: not every platform can open a
 /// directory.
 fn sync_dir(dir: &Path) {
@@ -318,9 +362,10 @@ impl Backend for FileBackend {
             return Ok(None);
         }
         let path = dir.join(&file);
-        let mut handle = match std::fs::File::open(&path) {
+        let mut handle = match open_entry(&path) {
             Ok(handle) => handle,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if is_symlink_refusal(&e) => return Err(not_a_regular_file(&path)),
             Err(e) => return Err(Error::Endpoint(format!("secret read: {e}"))),
         };
         if !exact_entry(dir, &file)? {
@@ -330,6 +375,11 @@ impl Backend for FileBackend {
         let meta = handle
             .metadata()
             .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
+        // Only a regular file is a secret: a FIFO or a device is refused before it is judged
+        // (so never `chmod`ed) or read (a FIFO's read would wait for a writer).
+        if !meta.is_file() {
+            return Err(not_a_regular_file(&path));
+        }
         modes::guard(&path, &meta, modes::FILE, |mode| {
             handle.set_permissions(mode)
         })?;
