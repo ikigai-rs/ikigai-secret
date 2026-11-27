@@ -58,6 +58,12 @@ be found.
   and its refusals.
 - **The fnox plugin's text.** The refusal sentences `contrib/fnox/ikigai.lua` raises, and its
   README.
+- **The fnox store's text** (since 0.5.4, the `ikigai-secret-fnox` connector in
+  `crates/ikigai-secret-fnox`): the refusals of a `fnox` store's settings, the start-up refusal
+  when its fnox file cannot be opened, the read-only refusal of every write, and the refusal of a
+  failed read, which names the store, the secret, the provider and how to sign in at the machine.
+  Each is written from the kind of fnox's error, never from fnox's own message, which can quote
+  the file or a value.
 
 ### Not ours to fix, still ours to report
 
@@ -92,6 +98,11 @@ tests exercise the order of checks and the reason strings without showing a real
 | The start-up notice for an existing install is one plain line | Pass | Same run: `src/store.rs` (`a_host_with_no_section_keeps_an_existing_store_and_gives_a_new_install_age_file`) and the `SecretConfig::for_host` doctest assert its opening, the deprecation sentence and that it names `age-file`. The whole line is not asserted. |
 | A copy between stores answers one sentence per outcome, never a value, and each refusal says what to do | Pass | Run on the ledger #4491 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `just gates` (fmt, clippy, `cargo test`: 137 passed, 0 failed, 3 ignored; `cargo doc`). `tests/copy.rs` asserts the whole sentence for a copy, a replace, the same value, a read-only target and a different value without `replace=true`, and the opening of the not-found refusal; each asserts no value appears. |
 | The prompt "Copy secret {name} from the store {from} to the store {to}" is asked after every capability and configuration check, and its refusal stands | Pass | Same run: `tests/copy.rs` (`a_copy_writes_the_target_and_never_deletes_the_source` asserts the reason text and the order of calls; `missing_any_one_gate_refuses_and_copies_nothing` that a refused call asks nobody and that a refused gate copies nothing). |
+| A `fnox` store's settings are refused in one sentence per problem, naming the line (no `config`, a relative one, `write = true`, an unknown `names`, a missing or misplaced `map`, a key that is not a fnox key, two names sent to one key) | Pass | Run on the ledger #4489 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `just gates` (fmt, clippy, `cargo test --workspace`, `cargo doc`). `src/store.rs` unit tests `a_fnox_store_is_refused_a_sentence_per_problem` and `a_map_sending_two_names_to_one_key_or_naming_no_fnox_key_is_refused` assert each sentence whole. |
+| A fnox store whose file cannot be opened refuses the host at start with one sentence naming the line and what to do, never quoting the file | Pass | Same run: `crates/ikigai-secret-fnox/tests/fnox_store.rs` (`a_store_that_cannot_be_opened_refuses_the_host_at_start`) asserts the whole sentence for a missing file and an invalid profile name, the ending for a file fnox refuses, and that a value-shaped string in that file never appears. |
+| A signed-out fnox provider is refused at once with a sentence naming the store, the secret, the provider and how to sign in at the machine; nothing waits on a prompt | Pass | Same run: `fnox_store.rs` (`a_signed_out_provider_refuses_at_once_and_never_prompts`) asserts the whole sentence for a passphrase-protected age identity, that fnox took its non-interactive branch, and that the refusal came within 20 seconds. Only the age provider is exercised offline; the sign-in commands named for 1Password, Bitwarden, AWS, Azure, GCP and Vault are asserted for 1Password only (`sign_in_names_the_command_for_the_common_providers`). |
+| A failed fnox read names the store and the provider, never a path or a value | Pass | Same run: `fnox_store.rs` (`a_provider_failure_names_the_store_and_provider_and_never_fnoxs_text`) asserts the whole sentence and that no value from the fnox file and no path appear. |
+| A write to a fnox store is refused with one sentence naming the store, after the capability check | Pass | Same run: `src/store.rs` (`a_fnox_store_refuses_every_write_and_reads_nothing_without_its_connector`) and `fnox_store.rs` (`every_write_is_refused_as_read_only`, `a_refused_caller_never_reaches_fnox_and_a_granted_one_does`, `a_secret_copies_from_a_fnox_store_into_a_file_store`) assert the sentence whole. |
 | The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
 | A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
 | The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
@@ -138,5 +149,6 @@ contact the maintainers privately first.
 | 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass run on main at `792de1e`; the two known barriers recorded as Fail rows. |
 | 2026-11-27 | 0.5.2 (ledger #4486): the configuration refusals and the inspection text in scope, with three Pass rows run on that branch. |
 | 2026-11-27 | The fnox plugin's refusals in scope (ledger #4492), one Pass row. |
+| 2026-11-27 | 0.5.4 (ledger #4489): the fnox store's text in scope, with five Pass rows run on that branch. |
 | 2026-11-27 | 0.5.3 (ledger #4488): the age-file store's text and the reencrypt prompt in scope, five Pass rows run on that branch. |
 | 2026-11-27 | 0.5.3 (ledger #4491): the copy's text and prompt in scope, two Pass rows run on that branch. |

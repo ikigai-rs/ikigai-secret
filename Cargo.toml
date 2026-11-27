@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -9,6 +9,14 @@ repository = "https://github.com/ikigai-rs/ikigai-secret"
 homepage = "https://github.com/ikigai-rs/ikigai-secret"
 keywords = ["ikigai", "roc", "secret", "keychain", "capability"]
 categories = ["os"]
+
+# The repository is a workspace (ledger #4489, `docs/storage-backends.md` section 9, decision 4):
+# this crate at the root, unchanged as a package, and the fnox connector beside it. The
+# connector is a HOST-role crate (fnox reads files and the environment and runs provider
+# commands); this crate stays a module and never depends on it. `cargo package` leaves the
+# nested package out of this crate's archive by itself.
+[workspace]
+members = ["crates/ikigai-secret-fnox"]
 
 [dependencies]
 # The kernel: Endpoint/Space/Capability/Error, and `config::data_home_from` for the file store's

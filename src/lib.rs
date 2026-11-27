@@ -52,7 +52,9 @@
 //! [`routed_space`] mounts it with four inspection resources under `urn:cap:secret:inspect`
 //! (where a name lives under the name's own read scope). With no section the configuration is
 //! exactly [`default_backend`]'s one store. Every capability check still happens before any store
-//! is consulted, and a route never widens a scope.
+//! is consulted, and a route never widens a scope. A `fnox` store (ledger #4489) is checked here
+//! and built by the host through the `ikigai-secret-fnox` connector in this repository, which
+//! passes its backends to [`SecretConfig::build_with_backends`]; this crate never depends on it.
 //!
 //! A secret's name never begins with `-`: there it would put the `-` where a capability scope
 //! marks an exclusion, which no grant can cover (`ikigai_core::is_deny_scope`, core 0.1.86).
@@ -80,8 +82,9 @@ pub use inspect::{
 };
 pub use ops::{COPY_TEMPLATE, REENCRYPT_TEMPLATE};
 pub use store::{
-    Found, RouteSpec, RouteTable, Routed, RoutingBackend, SecretConfig, SecretConfigError,
-    SecretSection, StoreKind, StoreSpec, StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
+    fnox_escape, fnox_read_only, is_fnox_key, FnoxNames, Found, RouteSpec, RouteTable, Routed,
+    RoutingBackend, SecretConfig, SecretConfigError, SecretSection, StoreKind, StoreSpec,
+    StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
 };
 
 /// A secret store: get / set / delete a named secret's bytes. Implemented by the OS
