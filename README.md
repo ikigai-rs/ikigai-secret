@@ -173,6 +173,12 @@ store = "local"
   `route:secret:`, belong to these resources, so generate refuses to mint into them.
   `space(backend)` binds none of them and is unchanged.
 
+**The other direction: ikigai as a fnox provider.** `contrib/fnox/ikigai.lua` is a fnox Lua
+plugin whose `get` reads a fnox secret through `ikigai --quiet -c 'source urn:secret:<name>'`, so
+fnox users get ikigai's per-name capabilities, presence gate and audit. It grants nothing and
+reads nothing else. Its README says how to declare it, that fnox plugins are not sandboxed, and
+what a refusal looks like (ledger #4492).
+
 `tests/routed.rs` walks the routed space with `ikigai-conformance` and pins by hand: every
 resource under its narrow grant, every routed path refused under no grants and under grants for
 other names with no store and no gate touched, a route never widening a scope, a miss staying
@@ -327,6 +333,9 @@ Stores and routes (ledger #4486), the first step of configurable secret storage 
   OS keystore.
 - New dependencies: `serde` (the section is `Deserialize`), `serde_json` (the JSON faces) and
   `glob` (a route's `match`); `toml` for tests only.
+- `contrib/fnox/ikigai.lua` (ledger #4492): ikigai as a fnox provider, `get` only, with
+  `tests/fnox_plugin.rs` testing the exact command line it builds in Lua 5.4 (`mlua`, a
+  dev-dependency, vendored). Not part of the Rust API.
 
 ## 0.5.1
 

@@ -49,6 +49,8 @@ be found.
 - **Inspection text.** The `text/plain` faces of `urn:secret:store`,
   `urn:secret:store:name:{store}` and `urn:secret:route` (since 0.5.2): one sentence per store or
   route. `urn:secret:route:secret:{name}` answers the bare store name, for scripts.
+- **The fnox plugin's text.** The refusal sentences `contrib/fnox/ikigai.lua` raises, and its
+  README.
 
 ### Not ours to fix, still ours to report
 
@@ -75,6 +77,7 @@ tests exercise the order of checks and the reason strings without showing a real
 | A refused `[secret]` section says, in one sentence per problem, which line is wrong and what to do | Pass | Run on the ledger #4486 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `cargo test`: 102 passed, 0 failed, 3 ignored. `src/store.rs` unit tests (`an_unknown_kind_is_refused_naming_the_line`, `a_route_to_an_unconfigured_store_is_refused`, `a_default_that_names_nothing_is_refused`, `two_routes_with_the_same_match_are_refused`, `mac_stores_are_refused_off_macos_and_accepted_on_it` and the rest) assert each sentence whole; `every_problem_is_reported_at_once_and_nothing_is_applied` asserts they are listed together. Checks the words, not how a host shows them. |
 | The inspection text faces are sentences in words, with no arrows or symbols standing for words | Pass | Same run: `tests/routed.rs` (`every_inspection_resource_answers_under_its_narrow_grant`) asserts the whole text of `urn:secret:store`, one store's lines and `urn:secret:route`. |
 | A write to a read-only store is refused with a sentence naming the store, before any presence prompt | Pass | Same run: `tests/routed.rs` (`a_read_only_store_refuses_writes_after_the_capability_and_before_presence`) asserts the sentence and that the gate was never asked. |
+| The fnox plugin's refusals are sentences: ikigai's own words, or a plain sentence saying which characters a name may use | Pass | `cargo test --test fnox_plugin` on 2026-11-27 (mlua 0.12, Lua 5.4 vendored): `a_refusal_is_an_error_in_ikigais_words`, `a_name_the_command_grammar_would_split_is_refused_before_any_command`. Read in a stand-in for fnox, not in fnox's own output. |
 | The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
 | A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
 | The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
@@ -120,3 +123,4 @@ contact the maintainers privately first.
 |---|---|
 | 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass run on main at `792de1e`; the two known barriers recorded as Fail rows. |
 | 2026-11-27 | 0.5.2 (ledger #4486): the configuration refusals and the inspection text in scope, with three Pass rows run on that branch. |
+| 2026-11-27 | The fnox plugin's refusals in scope (ledger #4492), one Pass row. |
