@@ -16,7 +16,7 @@ Where a secret is stored is decided in code, not configuration. `default_backend
 and every host calls it: the embedded host (`ikigai-cli/crates/ikigai-embedded/src/lib.rs:2878`,
 `:2895`, `:5394`) and gonk (`ikigai-gonk/src/onboard.rs:1053`, `src/main.rs:1876`). So:
 
-- a Linux server (lawnboy, the edge) keeps every secret in a plaintext file store, with only file
+- a Linux server or a rented VPS keeps every secret in a plaintext file store, with only file
   modes between it and anyone who reads the disk or a backup;
 - an operator who already keeps secrets in 1Password, Vault, a cloud secret manager or a
   password store cannot point ikigai at them;
