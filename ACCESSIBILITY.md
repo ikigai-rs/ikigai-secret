@@ -38,7 +38,8 @@ be found.
   `urn:secret:{name}` ask the presence gate, after every capability and argument check. The
   platform gate, `BiometricGate`, shows the operating system's own authentication dialog with this
   library's reason text: "Unlock ikigai secrets", "Delete secret {name}", "Generate signing key
-  {name}", "Generate encryption key {name}".
+  {name}", "Generate encryption key {name}", and (since 0.5.3) "Encrypt the secrets in the store
+  {store}" before `urn:secret:store:name:{store}:reencrypt`.
 - **Error text.** The sentences in `Error::Denied`, `Error::InvalidArgument` and `Error::Endpoint`
   values this library returns, which hosts may show to people (for example, why a secret name
   beginning with `-` is refused).
@@ -49,6 +50,9 @@ be found.
 - **Inspection text.** The `text/plain` faces of `urn:secret:store`,
   `urn:secret:store:name:{store}` and `urn:secret:route` (since 0.5.2): one sentence per store or
   route. `urn:secret:route:secret:{name}` answers the bare store name, for scripts.
+- **The age-file store's text** (since 0.5.3): the refusal when an encrypted secret cannot be
+  opened, the refusals of an `age-file` store's settings and of age keys, the one line per item a
+  reencrypt answers, and the start-up notice `SecretConfig::notice` gives a host to print.
 - **The fnox plugin's text.** The refusal sentences `contrib/fnox/ikigai.lua` raises, and its
   README.
 
@@ -78,6 +82,11 @@ tests exercise the order of checks and the reason strings without showing a real
 | The inspection text faces are sentences in words, with no arrows or symbols standing for words | Pass | Same run: `tests/routed.rs` (`every_inspection_resource_answers_under_its_narrow_grant`) asserts the whole text of `urn:secret:store`, one store's lines and `urn:secret:route`. |
 | A write to a read-only store is refused with a sentence naming the store, before any presence prompt | Pass | Same run: `tests/routed.rs` (`a_read_only_store_refuses_writes_after_the_capability_and_before_presence`) asserts the sentence and that the gate was never asked. |
 | The fnox plugin's refusals are sentences: ikigai's own words, or a plain sentence saying which characters a name may use | Pass | `cargo test --test fnox_plugin` on 2026-11-27 (mlua 0.12, Lua 5.4 vendored): `a_refusal_is_an_error_in_ikigais_words`, `a_name_the_command_grammar_would_split_is_refused_before_any_command`. Read in a stand-in for fnox, not in fnox's own output. |
+| An `age-file` store's settings are refused in one sentence per problem, naming the line (no `identity`, a `recipients` entry that is not an age recipient, no `path` and no home) | Pass | Run on the ledger #4488 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `just gates` (fmt, clippy, `cargo test`: 128 passed, 0 failed, 3 ignored; `cargo doc`). `src/store.rs` unit test `an_age_file_store_without_identity_or_with_a_bad_recipient_is_refused` asserts each sentence whole. |
+| An encrypted secret that cannot be opened is refused with a sentence saying why and what to do, never served as the secret | Pass | Same run: `tests/age_file.rs` (`an_item_sealed_to_another_identity_is_refused_never_served_as_the_secret`) asserts the whole sentence for an item sealed to another identity, and the reason for a torn one. |
+| A reencrypt answers one sentence per item, then a summary, with no value and no other caller's names | Pass | Same run: `tests/age_file.rs` (`reencrypt_converts_everything_and_a_second_run_changes_nothing`) asserts the whole answer, `reencrypt_reads_and_names_only_what_the_caller_may_write` that no other name appears, `a_crash_mid_reencrypt_leaves_every_item_readable` the line and the summary for an item left as it was. |
+| The presence prompt "Encrypt the secrets in the store {store}" is asked after every capability check, and its refusal stands | Pass | Same run: `tests/age_file.rs` (`reencrypt_converts_everything_and_a_second_run_changes_nothing` asserts the reason text; `reencrypt_reads_and_names_only_what_the_caller_may_write` and `reencrypt_refuses_a_store_that_is_not_age_file_or_is_read_only_before_the_gate` that a refused call never asks; `a_refused_presence_gate_reencrypts_nothing`). |
+| The start-up notice for an existing install is one plain line | Pass | Same run: `src/store.rs` (`a_host_with_no_section_keeps_an_existing_store_and_gives_a_new_install_age_file`) and the `SecretConfig::for_host` doctest assert its opening, the deprecation sentence and that it names `age-file`. The whole line is not asserted. |
 | The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
 | A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
 | The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
@@ -124,3 +133,4 @@ contact the maintainers privately first.
 | 2026-11-12 | "How it is tested" as a Pass / Fail / Blocked table, each Pass run on main at `792de1e`; the two known barriers recorded as Fail rows. |
 | 2026-11-27 | 0.5.2 (ledger #4486): the configuration refusals and the inspection text in scope, with three Pass rows run on that branch. |
 | 2026-11-27 | The fnox plugin's refusals in scope (ledger #4492), one Pass row. |
+| 2026-11-27 | 0.5.3 (ledger #4488): the age-file store's text and the reencrypt prompt in scope, five Pass rows run on that branch. |

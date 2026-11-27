@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -47,6 +47,14 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # the ed25519 signing key, whose identity/recipient strings `ikigai-encrypt` consumes as
 # `key=`/`to=`. Only the x25519 keygen is used (no armor/encrypt here), so default-features off.
 age = { version = "0.11", default-features = false }
+# The `age-file` store (ledger #4488) seals and opens each item through ikigai-encrypt's library,
+# the ecosystem's ONE implementation of age (`ikigai_encrypt::age::{seal, open, parse_identities,
+# parse_recipients}`, with its low-order recipient check and contained panics), rather than a
+# second copy here. `default-features = false`: the library alone, no kernel endpoints, no armor
+# (the store writes binary age), so it links neither ikigai-core nor async-trait through it.
+# 0.5.0 is the release whose library is the `age` module above. ⚠ "0.5.0" is a CEILING too
+# (<0.6.0).
+ikigai-encrypt = { version = "0.5.0", default-features = false }
 
 # The macOS Keychain backend (Security.framework generic passwords). Gated off other
 # platforms, which fall back to the dev file store.

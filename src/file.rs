@@ -6,7 +6,7 @@
 //! `urn:secret:{name}` answers with, so it opens its own directory by design. Keeping every such
 //! operation here lets one named exception cover exactly the keystore and nothing else.
 
-// ambient: fs: the file keystore is this connector's job: it owns the private secrets directory (create, judge its owner and mode, list, read, atomic write, delete) and nothing outside it
+// ambient: fs: the file keystore is this connector's job: it owns the private secrets directory (create, judge its owner and mode, list, read, atomic write, delete), the backup copy reencrypt makes beside it, and nothing else
 #![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
@@ -105,7 +105,7 @@ impl FileBackend {
         FileBackend { dir: Err(why) }
     }
 
-    fn dir(&self) -> Result<&Path> {
+    pub(crate) fn dir(&self) -> Result<&Path> {
         self.dir
             .as_deref()
             .map_err(|why| Error::Endpoint(why.clone()))
@@ -360,6 +360,280 @@ fn create_atomic(dir: &Path, target: &Path, value: &[u8]) -> Result<bool> {
     }
 }
 
+/// What identifies the file a read saw, so a later rewrite can tell whether it was replaced
+/// meanwhile: a write renames a NEW file over the name, which changes its inode (Unix), and
+/// changes its length or modification time anywhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Stamp {
+            #[cfg(unix)]
+            dev_ino: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            },
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
+/// Read the entry `file` in the store `dir` (known to exist): `None` when there is none, else
+/// its bytes and the [`Stamp`] of the file read. Refuses an entry that is not a regular file,
+/// one that differs from `file` only in case (a legacy entry on a volume that folds case), and
+/// one someone else could have written; tightens one others can only read.
+fn read_entry(dir: &Path, file: &str) -> Result<Option<(Vec<u8>, Stamp)>> {
+    use std::io::Read;
+    let path = dir.join(file);
+    let mut handle = match open_entry(&path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if is_symlink_refusal(&e) => return Err(not_a_regular_file(&path)),
+        Err(e) => return Err(Error::Endpoint(format!("secret read: {e}"))),
+    };
+    if !exact_entry(dir, file)? {
+        return Err(ambiguous(dir, file));
+    }
+    // On the handle, not the path: what is judged is exactly what is then read.
+    let meta = handle
+        .metadata()
+        .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
+    // Only a regular file is a secret: a FIFO or a device is refused before it is judged
+    // (so never `chmod`ed) or read (a FIFO's read would wait for a writer).
+    if !meta.is_file() {
+        return Err(not_a_regular_file(&path));
+    }
+    modes::guard(&path, &meta, modes::FILE, |mode| {
+        handle.set_permissions(mode)
+    })?;
+    let mut bytes = Vec::new();
+    handle
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
+    Ok(Some((bytes, Stamp::of(&meta))))
+}
+
+// =====================================================================================
+// What the age-file store needs of the directory (ledger #4488). The encryption is not here:
+// `age_file.rs` seals and opens, and calls these for every byte that touches the disk, so this
+// module stays the crate's only reach into the filesystem.
+// =====================================================================================
+
+/// The hidden file an `age-file` store keeps in its directory. Hidden, so never a secret's file
+/// name and invisible to every release of the file store, which serves only names a secret's
+/// name maps to. It tells a host with no `[secret]` section that the directory is the age-file
+/// store a new install made, not a plaintext store from before (see `found_install`).
+pub(crate) const AGE_MARKER: &str = ".ikigai-age-file";
+
+/// The marker's content: for a person who opens the directory at the box.
+const AGE_MARKER_TEXT: &str = "This directory is an ikigai-secret age-file store: each file is \
+one secret, encrypted to the store's age recipients (open one with `age -d -i <identity>`). \
+Keep plaintext out of it.\n";
+
+/// One entry of a store directory: its file name, and the secret name that file name spells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Item {
+    /// The file name, as on disk.
+    pub file: String,
+    /// The secret's name: the file name unescaped, or the file name itself when it is not the
+    /// escape of any name (a legacy entry written by 0.1.6 or earlier).
+    pub name: String,
+}
+
+/// The secret name a file name spells: the inverse of [`file_name`]. `%` and two lowercase hex
+/// digits are one byte; everything else is itself. A file name that is not exactly the escape of
+/// some name (uppercase kept verbatim by 0.1.6 or earlier, a `%` not followed by two lowercase
+/// hex digits, bytes that are not UTF-8) answers itself.
+pub(crate) fn name_of(file: &str) -> String {
+    let bytes = file.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            match (
+                bytes.get(i + 1).and_then(|&b| hex(b)),
+                bytes.get(i + 2).and_then(|&b| hex(b)),
+            ) {
+                (Some(high), Some(low)) => {
+                    out.push(high << 4 | low);
+                    i += 3;
+                    continue;
+                }
+                _ => return file.to_string(),
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    match String::from_utf8(out) {
+        Ok(name) if file_name(&name).ok().as_deref() == Some(file) => name,
+        _ => file.to_string(),
+    }
+}
+
+/// What is already in a store directory, for a host with no `[secret]` section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirState {
+    /// No directory, or one with no secret in it (hidden files, temporary or not, are not).
+    Empty,
+    /// The age-file store's marker is there.
+    AgeFile,
+    /// At least one secret, and no marker: a file store from before.
+    Plain,
+}
+
+/// What `dir` holds, judged without reading any secret.
+pub(crate) fn dir_state(dir: &Path) -> Result<DirState> {
+    if !check_dir(dir)? {
+        return Ok(DirState::Empty);
+    }
+    if dir.join(AGE_MARKER).symlink_metadata().is_ok() {
+        return Ok(DirState::AgeFile);
+    }
+    Ok(if items(dir)?.is_empty() {
+        DirState::Empty
+    } else {
+        DirState::Plain
+    })
+}
+
+/// Make the store directory (private) if it is absent, and leave the age-file marker in it if it
+/// is not there yet. Written once, exclusively, so two writers racing both succeed.
+pub(crate) fn mark_age_file(dir: &Path) -> Result<()> {
+    ensure_dir(dir)?;
+    let target = dir.join(AGE_MARKER);
+    if target.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    create_atomic(dir, &target, AGE_MARKER_TEXT.as_bytes()).map(|_| ())
+}
+
+/// Every secret in `dir`, sorted by file name: each entry whose name is not hidden. Temporary
+/// files and the marker are hidden; an entry that is not a regular file is listed, and reading
+/// it refuses.
+pub(crate) fn items(dir: &Path) -> Result<Vec<Item>> {
+    let io = |e: std::io::Error| Error::Endpoint(format!("secret store listing: {e}"));
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let Some(file) = entry.file_name().to_str().map(str::to_string) else {
+            continue; // not UTF-8: no secret name maps to it
+        };
+        if file.starts_with('.') {
+            continue;
+        }
+        out.push(Item {
+            name: name_of(&file),
+            file,
+        });
+    }
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(out)
+}
+
+/// Read one listed entry: its bytes and the stamp of the file read, or `None` if it has gone.
+pub(crate) fn read_item(dir: &Path, file: &str) -> Result<Option<(Vec<u8>, Stamp)>> {
+    read_entry(dir, file)
+}
+
+/// Write `bytes` over the entry `file` (a temporary file, synced, renamed over it), but only if
+/// the file there is still the one `stamp` describes: `Ok(false)`, nothing written, when it was
+/// replaced or removed since it was read. The check and the rename are two steps, so a write that
+/// lands in the microseconds between them can still be overwritten; the window is that small, not
+/// closed.
+pub(crate) fn replace_if_unchanged(
+    dir: &Path,
+    file: &str,
+    stamp: &Stamp,
+    bytes: &[u8],
+) -> Result<bool> {
+    let target = dir.join(file);
+    let tmp = write_temp(dir, bytes)?;
+    let current = target.symlink_metadata().ok().map(|meta| Stamp::of(&meta));
+    if current.as_ref() != Some(stamp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Endpoint(format!("secret write: {e}")));
+    }
+    sync_dir(dir);
+    Ok(true)
+}
+
+/// Copy every secret in `dir` into a new private sibling directory, `<dir>.backup-<seconds>`
+/// (`-2`, `-3`… when that is taken), and answer its path. Modes as the store's: the directory
+/// `0700`, each file `0600`. Only regular files are copied; anything else is left out (reading it
+/// refuses anyway). A failure removes the partial copy.
+pub(crate) fn backup(dir: &Path) -> Result<PathBuf> {
+    let io = |e: std::io::Error| Error::Endpoint(format!("secrets store backup: {e}"));
+    let base = dir.file_name().ok_or_else(|| {
+        Error::Endpoint(format!(
+            "the secrets store {} has no directory name to back up beside",
+            dir.display()
+        ))
+    })?;
+    let parent = dir.parent().unwrap_or(Path::new("/"));
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, modes::DIR);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    let mut attempt = 1;
+    let target = loop {
+        let mut name = base.to_os_string();
+        name.push(format!(".backup-{seconds}"));
+        if attempt > 1 {
+            name.push(format!("-{attempt}"));
+        }
+        let target = parent.join(name);
+        match builder.create(&target) {
+            Ok(()) => break target,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(io(e)),
+        }
+    };
+    let copied = (|| {
+        modes::set(&target, modes::DIR).map_err(io)?;
+        for item in items(dir)? {
+            let Ok(Some((bytes, _))) = read_entry(dir, &item.file) else {
+                continue;
+            };
+            let tmp = write_temp(&target, &bytes)?;
+            std::fs::rename(&tmp, target.join(&item.file)).map_err(io)?;
+        }
+        sync_dir(&target);
+        Ok(())
+    })();
+    if let Err(e) = copied {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(e);
+    }
+    Ok(target)
+}
+
 impl Backend for FileBackend {
     /// Whether the store directory can be reached, judged without reading any secret and
     /// without naming the directory: `reachable`, `reachable, empty` (it is made on the first
@@ -379,38 +653,11 @@ impl Backend for FileBackend {
     }
 
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        use std::io::Read;
         let (dir, file) = self.locate(name)?;
         if !check_dir(dir)? {
             return Ok(None);
         }
-        let path = dir.join(&file);
-        let mut handle = match open_entry(&path) {
-            Ok(handle) => handle,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) if is_symlink_refusal(&e) => return Err(not_a_regular_file(&path)),
-            Err(e) => return Err(Error::Endpoint(format!("secret read: {e}"))),
-        };
-        if !exact_entry(dir, &file)? {
-            return Err(ambiguous(dir, &file));
-        }
-        // On the handle, not the path: what is judged is exactly what is then read.
-        let meta = handle
-            .metadata()
-            .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
-        // Only a regular file is a secret: a FIFO or a device is refused before it is judged
-        // (so never `chmod`ed) or read (a FIFO's read would wait for a writer).
-        if !meta.is_file() {
-            return Err(not_a_regular_file(&path));
-        }
-        modes::guard(&path, &meta, modes::FILE, |mode| {
-            handle.set_permissions(mode)
-        })?;
-        let mut bytes = Vec::new();
-        handle
-            .read_to_end(&mut bytes)
-            .map_err(|e| Error::Endpoint(format!("secret read: {e}")))?;
-        Ok(Some(bytes))
+        Ok(read_entry(dir, &file)?.map(|(bytes, _)| bytes))
     }
 
     fn set(&self, name: &str, value: &[u8]) -> Result<()> {

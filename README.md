@@ -137,10 +137,11 @@ match = "owner:id:acme:name:*"  # a glob on the full secret name (`*`, `?`, `[..
 store = "local"
 ```
 
-- **Kinds.** `keychain`, `secure-enclave` (both macOS only) and `file` are built here.
-  `age-file` and `fnox` are accepted kinds that are refused as "not built yet" until their own
-  tasks land. Each kind reads only its own settings: `keychain` reads `service`,
-  `secure-enclave` reads `label_prefix`, `file` reads `path`, and every kind reads `write`.
+- **Kinds.** `keychain`, `secure-enclave` (both macOS only), `file` and `age-file` (since
+  0.5.3, below) are built here. `fnox` is an accepted kind that is refused as "not built yet"
+  until its own task lands. Each kind reads only its own settings: `keychain` reads `service`,
+  `secure-enclave` reads `label_prefix`, `file` reads `path`, `age-file` reads `path`,
+  `identity` and `recipients`, and every kind reads `write`.
 - **Refused whole.** An unknown kind, a kind not built yet, a Mac store off macOS, a setting
   of another kind, a store name that is not lowercase letters, digits, `-` and `_`, a missing
   `default` or one that names no store, a route to a store that is not configured, a `match`
@@ -154,8 +155,10 @@ store = "local"
   called, so a route only says where an allowed operation goes. A write to a name routed to a
   store with `write = false` is refused as Conflict after the capability check and before the
   presence gate.
-- **No section** is exactly today: one store, the one `default_backend()` builds (the Keychain
-  under `ikigai-secret` on a Mac, the file store in its usual place elsewhere), with no routes.
+- **No section** is exactly today for an EXISTING install: one store, the one
+  `default_backend()` builds (the Keychain under `ikigai-secret` on a Mac, the file store in its
+  usual place elsewhere), with no routes. A NEW install gets an `age-file` store instead; see
+  "The age-file store", below, for how a host tells them apart.
 - **Inspection.** `routed_space(routing)` (or `routed_space_with_gate`) mounts every face of
   `space()` over the routing backend, plus four resources that never carry a path, an
   account, a token or a value. Each answers `text/plain`, or `application/json` with
@@ -172,6 +175,63 @@ store = "local"
   routed space the names `store` and `route`, and every name beginning `store:name:` or
   `route:secret:`, belong to these resources, so generate refuses to mint into them.
   `space(backend)` binds none of them and is unchanged.
+
+## The age-file store
+
+`kind = "age-file"` (ledger #4488, the design's section 6.3) is the file store with each item
+encrypted at rest. The directory layout, the modes, the atomic writes and the
+regular-file-only reads are the file store's, unchanged; each item is a whole binary age file,
+so the stock tool opens one at the box (`age -d -i <identity> <file>`).
+
+```toml
+[secret.store.server]
+kind = "age-file"
+path = "/srv/ikigai/secrets"        # absent: the data home's `secrets` directory
+identity = "file:/etc/ikigai/age"   # where the HOST gets the age identity from
+recipients = ["age1…"]              # more recipients every item is sealed to (a recovery key)
+```
+
+- **The identity is the host's.** Building an age identity may read a file or run an age
+  plugin (`age-plugin-se`, `age-plugin-yubikey`, `age-plugin-tpm`), which only a host-role crate
+  may do, so this crate never resolves `identity`: it carries the string, and the host builds an
+  `AgeKeys` (seal to every recipient, open with the identity) and passes it to
+  `SecretConfig::build_with_keys(keys)`, by store name. `X25519Keys::new(identity_text,
+  recipients)` is the one built here, from identity text the host already read, sealing through
+  `ikigai_encrypt::age` (the ecosystem's one implementation of age). Every item is sealed to the
+  identity's own recipient and to each configured one, so a recovery key opens every item too.
+  A plugin recipient needs a host-built `AgeKeys`; `X25519Keys` refuses one, saying so.
+  `build()` still works: an `age-file` store it makes refuses every operation with a sentence
+  saying the host gave it no identity.
+- **A mixed store reads both.** A store moved in place from `file` (same `path`, `kind =
+  "age-file"`) still serves its plaintext items; a write always encrypts, so each item is
+  re-encrypted on its next write. An item is ciphertext exactly when it begins with age's header
+  line (`AGE_HEADER`). An age file this store's identity cannot open, or one that is not whole,
+  is refused with a sentence, never handed back as if it were the secret.
+- **Reencrypt.** `urn:secret:store:name:{store}:reencrypt` (Sink, id `secret-store-reencrypt`)
+  encrypts every plaintext item at once: one item at a time, each a temporary file renamed over
+  the old one, after a backup copy of the directory beside it (`<dir>.backup-<seconds>`, `0700`,
+  files `0600`), with one line per item. Idempotent: an item already encrypted is left
+  unchanged, and a run with nothing to convert makes no backup. Under the write scope of each
+  item it rewrites (`urn:cap:secret:write:<name>`; an item the caller may not write is neither
+  read nor named), then the presence gate ("Encrypt the secrets in the store {store}"). A crash
+  at any point leaves every item readable, as plaintext or as ciphertext; the answer is refused,
+  with its lines, when any item was left as it was, and running it again finishes the job.
+- **The default for new installs.** `found_install(home)` says what a host with no `[secret]`
+  section finds, judged without reading any secret: `IKIGAI_SECRETS` set, a file store
+  directory holding a secret, or (on a Mac) any Keychain item under `ikigai-secret` is an
+  EXISTING install; the age-file store's marker (a hidden `.ikigai-age-file` file it leaves in
+  its directory on its first write) is the age-file store an earlier start made; anything else
+  is new. `SecretConfig::for_host(section, home, found)` then answers the section when there is
+  one, today's store for an existing install (and `notice()` has the one line the host prints at
+  start: `age-file` is the new default, how to move, and that `IKIGAI_SECRETS` is deprecated),
+  and otherwise one `age-file` store named `age-file` in the data home's `secrets` directory,
+  whose `identity` is `HOST_DEFAULT_IDENTITY` (`"default"`: the host's own default source).
+  `default_backend()` and `from_section(None, …)` are unchanged, so no host changes behavior
+  until it calls `for_host`.
+
+`tests/age_file.rs` pins the upgrade from a store as 0.5.1 wrote it (built byte for byte),
+`reencrypt` and its second run, a crash mid-reencrypt, a downgrade then a re-upgrade, the
+capability and presence order, and the new-install default.
 
 **The other direction: ikigai as a fnox provider.** `contrib/fnox/ikigai.lua` is a fnox Lua
 plugin whose `get` reads a fnox secret through `ikigai --quiet -c 'source urn:secret:<name>'`, so
@@ -312,6 +372,24 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
+
+## 0.5.3
+
+The `age-file` store (ledger #4488), the second step of configurable secret storage (epic
+ledger #4485). Additive, so a patch: nothing a 0.5.2 host calls changes behavior.
+
+- `StoreKind::AgeFile` and the `[secret]` section's `age-file` kind, reading `path`, `identity`
+  and the new `recipients`; refused, a sentence each, with no `identity`, with a `recipients`
+  entry that is not an age recipient, and with no `path` and no home. `fnox` is still refused as
+  not built yet. A refusal of another kind's setting now says "an age-file store".
+- `AgeKeys`, `AgeError`, `X25519Keys`, `AgeFileBackend`, `AGE_HEADER`, `Reencrypted` and
+  `SecretConfig::build_with_keys`: see "The age-file store", above.
+- `urn:secret:store:name:{store}:reencrypt` (`REENCRYPT_TEMPLATE`, id `secret-store-reencrypt`) in
+  the routed space, and a `Backend::reencrypt` method whose default refuses. ⚠ A backend that
+  wraps another should forward it.
+- `found_install`, `Found`, `SecretConfig::for_host`, `SecretConfig::notice` and
+  `HOST_DEFAULT_IDENTITY`: the new-install default.
+- New dependency: `ikigai-encrypt` 0.5 with `default-features = false` (its age library only).
 
 ## 0.5.2
 
