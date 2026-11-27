@@ -39,7 +39,8 @@ be found.
   platform gate, `BiometricGate`, shows the operating system's own authentication dialog with this
   library's reason text: "Unlock ikigai secrets", "Delete secret {name}", "Generate signing key
   {name}", "Generate encryption key {name}", and (since 0.5.3) "Encrypt the secrets in the store
-  {store}" before `urn:secret:store:name:{store}:reencrypt`.
+  {store}" before `urn:secret:store:name:{store}:reencrypt` and "Copy secret {name} from the
+  store {from} to the store {to}" before `urn:secret:store:name:{to}:copy`.
 - **Error text.** The sentences in `Error::Denied`, `Error::InvalidArgument` and `Error::Endpoint`
   values this library returns, which hosts may show to people (for example, why a secret name
   beginning with `-` is refused).
@@ -53,6 +54,8 @@ be found.
 - **The age-file store's text** (since 0.5.3): the refusal when an encrypted secret cannot be
   opened, the refusals of an `age-file` store's settings and of age keys, the one line per item a
   reencrypt answers, and the start-up notice `SecretConfig::notice` gives a host to print.
+- **The copy's text** (since 0.5.3): one sentence per outcome of `urn:secret:store:name:{to}:copy`,
+  and its refusals.
 - **The fnox plugin's text.** The refusal sentences `contrib/fnox/ikigai.lua` raises, and its
   README.
 
@@ -87,6 +90,8 @@ tests exercise the order of checks and the reason strings without showing a real
 | A reencrypt answers one sentence per item, then a summary, with no value and no other caller's names | Pass | Same run: `tests/age_file.rs` (`reencrypt_converts_everything_and_a_second_run_changes_nothing`) asserts the whole answer, `reencrypt_reads_and_names_only_what_the_caller_may_write` that no other name appears, `a_crash_mid_reencrypt_leaves_every_item_readable` the line and the summary for an item left as it was. |
 | The presence prompt "Encrypt the secrets in the store {store}" is asked after every capability check, and its refusal stands | Pass | Same run: `tests/age_file.rs` (`reencrypt_converts_everything_and_a_second_run_changes_nothing` asserts the reason text; `reencrypt_reads_and_names_only_what_the_caller_may_write` and `reencrypt_refuses_a_store_that_is_not_age_file_or_is_read_only_before_the_gate` that a refused call never asks; `a_refused_presence_gate_reencrypts_nothing`). |
 | The start-up notice for an existing install is one plain line | Pass | Same run: `src/store.rs` (`a_host_with_no_section_keeps_an_existing_store_and_gives_a_new_install_age_file`) and the `SecretConfig::for_host` doctest assert its opening, the deprecation sentence and that it names `age-file`. The whole line is not asserted. |
+| A copy between stores answers one sentence per outcome, never a value, and each refusal says what to do | Pass | Run on the ledger #4491 branch on 2026-11-27, macOS (arm64), rustc 1.100.0, `just gates` (fmt, clippy, `cargo test`: 137 passed, 0 failed, 3 ignored; `cargo doc`). `tests/copy.rs` asserts the whole sentence for a copy, a replace, the same value, a read-only target and a different value without `replace=true`, and the opening of the not-found refusal; each asserts no value appears. |
+| The prompt "Copy secret {name} from the store {from} to the store {to}" is asked after every capability and configuration check, and its refusal stands | Pass | Same run: `tests/copy.rs` (`a_copy_writes_the_target_and_never_deletes_the_source` asserts the reason text and the order of calls; `missing_any_one_gate_refuses_and_copies_nothing` that a refused call asks nobody and that a refused gate copies nothing). |
 | The macOS prompt can be passed without biometrics | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: the policy is `PolicyBuilder::new().biometrics(Some(BiometricStrength::Strong))`, with no device-password fallback. See Known limitations. |
 | A failed prompt reports a plain sentence | Fail | Source review of `BiometricGate` in `src/lib.rs` on 2026-11-12: `biometric check failed: {e:?}` puts the platform error's debug form in the message. |
 | The real system prompt (Touch ID sheet) | Blocked | Exercised only by hand on a Mac, with no recorded date or result. No CI job can show it. |
@@ -134,3 +139,4 @@ contact the maintainers privately first.
 | 2026-11-27 | 0.5.2 (ledger #4486): the configuration refusals and the inspection text in scope, with three Pass rows run on that branch. |
 | 2026-11-27 | The fnox plugin's refusals in scope (ledger #4492), one Pass row. |
 | 2026-11-27 | 0.5.3 (ledger #4488): the age-file store's text and the reencrypt prompt in scope, five Pass rows run on that branch. |
+| 2026-11-27 | 0.5.3 (ledger #4491): the copy's text and prompt in scope, two Pass rows run on that branch. |

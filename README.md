@@ -229,6 +229,34 @@ recipients = ["age1…"]              # more recipients every item is sealed to 
   `default_backend()` and `from_section(None, …)` are unchanged, so no host changes behavior
   until it calls `for_host`.
 
+## Copying between stores
+
+`urn:secret:store:name:{to}:copy from={store} name={name}` (Sink, id `secret-store-copy`, ledger
+#4491) copies one secret from the store `from` into the store `{to}` and never deletes the
+source: how an install moves its secrets into a new store after adding a `[secret]` section
+(a name newly routed to another store is NotFound there until it is copied). The name can also
+be piped in as `content` (one name; a trailing newline is dropped), exactly one of the two.
+
+```text
+sink urn:secret:store:name:server:copy from=keychain name=zoom.client-secret
+```
+
+- **Three gates, in order:** the name's read scope `urn:cap:secret:read:<name>` AND its write
+  scope `urn:cap:secret:write:<name>` (both declared as floors, both checked exactly), then the
+  configuration (both stores configured, not the same store, the target writable and able to
+  hold a value, the source not a Secure Enclave), then the presence gate ("Copy secret {name}
+  from the store {from} to the store {to}"). Only then is either store asked anything, so a
+  refused copy reads nothing, writes nothing and prompts nobody.
+- **Refused:** into a read-only store (Conflict), from a store that does not hold the name
+  (NotFound), and into a store that already holds a different value (Conflict) unless
+  `replace=true`. The same value already there writes nothing. Each outcome is one sentence, and
+  no answer ever carries a value.
+- The write is the target store's own: a free name is created exclusively and a replace is the
+  store's atomic replace, so a failure leaves the target as it was and the source untouched.
+
+`tests/copy.rs` pins each gate missing alone, every refusal and outcome, a copy into an
+age-file store (encrypted there), and the move out of a store laid out as 0.5.1 wrote it.
+
 `tests/age_file.rs` pins the upgrade from a store as 0.5.1 wrote it (built byte for byte),
 `reencrypt` and its second run, a crash mid-reencrypt, a downgrade then a re-upgrade, the
 capability and presence order, and the new-install default.
@@ -375,8 +403,9 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
 
 ## 0.5.3
 
-The `age-file` store (ledger #4488), the second step of configurable secret storage (epic
-ledger #4485). Additive, so a patch: nothing a 0.5.2 host calls changes behavior.
+The `age-file` store (ledger #4488) and copying between stores (ledger #4491), the next steps
+of configurable secret storage (epic ledger #4485). Additive, so a patch: nothing a 0.5.2 host
+calls changes behavior.
 
 - `StoreKind::AgeFile` and the `[secret]` section's `age-file` kind, reading `path`, `identity`
   and the new `recipients`; refused, a sentence each, with no `identity`, with a `recipients`
@@ -389,6 +418,8 @@ ledger #4485). Additive, so a patch: nothing a 0.5.2 host calls changes behavior
   wraps another should forward it.
 - `found_install`, `Found`, `SecretConfig::for_host`, `SecretConfig::notice` and
   `HOST_DEFAULT_IDENTITY`: the new-install default.
+- `urn:secret:store:name:{to}:copy` (`COPY_TEMPLATE`, id `secret-store-copy`) in the routed
+  space: see "Copying between stores", above.
 - New dependency: `ikigai-encrypt` 0.5 with `default-features = false` (its age library only).
 
 ## 0.5.2

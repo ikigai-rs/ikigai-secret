@@ -78,7 +78,7 @@ pub use file::FileBackend;
 pub use inspect::{
     INSPECT_SCOPE, ROUTE_IRI, ROUTE_SECRET_TEMPLATE, STORE_IRI, STORE_NAME_TEMPLATE,
 };
-pub use ops::REENCRYPT_TEMPLATE;
+pub use ops::{COPY_TEMPLATE, REENCRYPT_TEMPLATE};
 pub use store::{
     Found, RouteSpec, RouteTable, Routed, RoutingBackend, SecretConfig, SecretConfigError,
     SecretSection, StoreKind, StoreSpec, StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
@@ -464,12 +464,17 @@ pub fn routed_space(routing: Arc<RoutingBackend>) -> EndpointSpace {
 ///   from the route table alone, never by asking a store. Under the name's own read scope,
 ///   `urn:cap:secret:read:<name>`.
 ///
-/// And one operation, bound ahead of them:
+/// And two operations, bound ahead of them:
 ///
 /// - [`REENCRYPT_TEMPLATE`] (`urn:secret:store:name:{store}:reencrypt`, Sink): encrypt one
 ///   `age-file` store's plaintext items in place, after a backup copy of its directory. Under the
 ///   write scope of each item it rewrites (an item the caller may not write is neither read nor
 ///   named), then the presence gate. One line per item, never a value.
+/// - [`COPY_TEMPLATE`] (`urn:secret:store:name:{to}:copy from={store} name={name}`, Sink): copy
+///   one secret from the store `from` into the store `{to}`, never deleting the source. Under
+///   the name's read scope AND its write scope, then the presence gate. Refused into a read-only
+///   store, from a store that does not hold the name (NotFound), and into a store holding a
+///   different value unless `replace=true`. One sentence, never a value.
 ///
 /// None of them ever names a path, an account, a token or a value (the reencrypt answer names
 /// the backup it made, for the operator who ran it). The names they are bound at

@@ -3,8 +3,8 @@
 Design spike for ledger #3748 (fnox, both directions), widened to the ask behind it: configurable
 options for where secrets are stored, as soon as possible. Status: **decided** (Brian, 2026-11-27;
 section 9). Section 10's task 1 (stores and routes, ledger #4486) and task 7 (the fnox Lua
-plugin's `get`, ledger #4492) are built for 0.5.2, and task 3 (`age-file`, ledger #4488) for
-0.5.3; the rest are filed.
+plugin's `get`, ledger #4492) are built for 0.5.2, and task 3 (`age-file`, ledger #4488) and
+task 6 (copy between stores, ledger #4491) for 0.5.3; the rest are filed.
 
 References are to this repository at `b083c84` (0.5.1) and to fnox 1.50.0 (released 2026-11-18,
 MIT, <https://fnox.jdx.dev>, <https://github.com/jdx/fnox>). The fnox facts below were read from
