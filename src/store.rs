@@ -73,8 +73,9 @@ use crate::{Backend, FileBackend, Reencrypted, Signed};
 pub const DEFAULT_SERVICE: &str = "ikigai-secret";
 
 /// Every store kind the `[secret]` section can name, in the order a refusal lists them. The
-/// first four are built here (`age-file` since 0.5.3, ledger #4488); `fnox` is accepted by the
-/// parser and refused as not built yet until its task lands.
+/// first four are built here (`age-file` since 0.5.3, ledger #4488). `fnox` (since 0.5.4, ledger
+/// #4489) is checked here and built by the host through the `ikigai-secret-fnox` connector, since
+/// fnox reads files and the environment and runs provider commands, which this crate never does.
 pub const STORE_KINDS: [&str; 5] = ["keychain", "secure-enclave", "file", "age-file", "fnox"];
 
 /// The thread every cacheable inspection answer hangs from. The configuration is read once, at
@@ -107,6 +108,15 @@ pub const CONFIG_THREAD: &str = "urn:secret:config";
 /// kind = "file"
 /// path = "~/.ikigai/secrets"          # file: absolute, or under the home the host passes
 /// write = false                       # any store: refuse writes (default true)
+///
+/// [secret.store.team]
+/// kind = "fnox"                       # read through fnox's library, read-only
+/// config = "~/work/acme/fnox.toml"    # the one fnox file; never fnox's upward search
+/// profile = "prod"                    # absent: fnox's default profile
+/// names = "map"                       # map (the default) | escaped
+///
+/// [secret.store.team.map]             # names = "map": ikigai name to fnox key, one to one
+/// "zoom.client-secret" = "ZOOM_CLIENT_SECRET"
 ///
 /// [[secret.route]]                    # read in order; the first match wins
 /// match = "owner:id:acme:name:*"      # a glob on the full secret name
@@ -158,16 +168,17 @@ pub struct StoreTable {
     /// recovery key kept off the machine). Each is an `age1…` recipient, X25519 or a plugin's.
     #[serde(default)]
     pub recipients: Option<Vec<String>>,
-    /// `fnox` (not built yet): the one fnox configuration file.
+    /// `fnox`: the one fnox configuration file, absolute or under the host's home. Required.
     #[serde(default)]
     pub config: Option<String>,
-    /// `fnox` (not built yet): the fnox profile.
+    /// `fnox`: the fnox profile (fnox's default profile when absent, never `FNOX_PROFILE`).
     #[serde(default)]
     pub profile: Option<String>,
-    /// `fnox` (not built yet): `map` or `escaped`.
+    /// `fnox`: how a secret name becomes a fnox key, `map` (the default) or `escaped`
+    /// ([`FnoxNames`]).
     #[serde(default)]
     pub names: Option<String>,
-    /// `fnox` (not built yet): ikigai name to fnox key.
+    /// `fnox` with `names = "map"`: ikigai name to fnox key, one to one.
     #[serde(default)]
     pub map: Option<BTreeMap<String, String>>,
 }
@@ -218,6 +229,105 @@ pub enum StoreKind {
         /// The configured recipients beyond the identity's own, as the section spells them.
         recipients: Vec<String>,
     },
+    /// One fnox configuration file, read through fnox's library by the host's
+    /// `ikigai-secret-fnox` connector. Always read-only.
+    Fnox {
+        /// The fnox configuration file. Only this file (and what it imports) is read, never
+        /// fnox's upward search from the working directory.
+        config: PathBuf,
+        /// The fnox profile, or `None` for fnox's default profile.
+        profile: Option<String>,
+        /// How a secret name becomes a fnox key.
+        names: FnoxNames,
+    },
+}
+
+/// How a `fnox` store turns a secret name into a fnox key. Both mappings are ONE TO ONE: a lossy
+/// one (`a.b` and `a-b` both becoming `A_B`) would let a caller allowed to read one name read the
+/// secret meant for the other, which it holds no scope for. So there is no third mapping.
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use ikigai_secret::FnoxNames;
+///
+/// let map = FnoxNames::Map(BTreeMap::from([("zoom.client-secret".into(), "ZOOM_SECRET".into())]));
+/// assert_eq!(map.key_for("zoom.client-secret").as_deref(), Some("ZOOM_SECRET"));
+/// assert_eq!(map.key_for("zoom.other"), None); // unlisted: NotFound
+///
+/// assert_eq!(FnoxNames::Escaped.key_for("zoom.client-secret").as_deref(),
+///            Some("zoom_2Eclient_2Dsecret"));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FnoxNames {
+    /// `names = "map"`, the default: the `[secret.store.<s>.map]` table, secret name to fnox key.
+    /// A name the table does not list is NotFound; a table sending two names to one key is
+    /// refused when the section is checked.
+    Map(BTreeMap<String, String>),
+    /// `names = "escaped"`: [`fnox_escape`], an injective transform, for a fnox file written for
+    /// ikigai.
+    Escaped,
+}
+
+impl FnoxNames {
+    /// The fnox key `name` reads, or `None` when it reads none (an unlisted name, or the empty
+    /// name), which the store answers as NotFound.
+    pub fn key_for(&self, name: &str) -> Option<String> {
+        match self {
+            FnoxNames::Map(map) => map.get(name).cloned(),
+            FnoxNames::Escaped => (!name.is_empty()).then(|| fnox_escape(name)),
+        }
+    }
+
+    /// The mapping's name, as the section spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            FnoxNames::Map(_) => "map",
+            FnoxNames::Escaped => "escaped",
+        }
+    }
+}
+
+/// The `escaped` mapping of a secret name to a fnox key: ASCII letters pass, and so do ASCII
+/// digits after the first character; every other character, `_` included, becomes `_` and two
+/// uppercase hex digits per UTF-8 byte (`.` is `_2E`, `_` is `_5F`). A leading digit is escaped
+/// too, because a fnox key cannot begin with one.
+///
+/// Injective: a literal is never `_`, and every `_` begins exactly three characters, so a key
+/// reads back to exactly one name and no two names meet. Every key it makes is a valid fnox key
+/// ([`is_fnox_key`]) when `name` is not empty.
+///
+/// ```
+/// use ikigai_secret::fnox_escape;
+///
+/// assert_eq!(fnox_escape("a.b"), "a_2Eb");
+/// assert_eq!(fnox_escape("a-b"), "a_2Db");
+/// assert_eq!(fnox_escape("a_b"), "a_5Fb");
+/// assert_eq!(fnox_escape("1password"), "_31password");
+/// assert_eq!(fnox_escape("owner:id:acme:name:db"), "owner_3Aid_3Aacme_3Aname_3Adb");
+/// ```
+pub fn fnox_escape(name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(name.len());
+    for (index, ch) in name.char_indices() {
+        if ch.is_ascii_alphabetic() || (index > 0 && ch.is_ascii_digit()) {
+            key.push(ch);
+        } else {
+            let mut buf = [0u8; 4];
+            for byte in ch.encode_utf8(&mut buf).bytes() {
+                let _ = write!(key, "_{byte:02X}");
+            }
+        }
+    }
+    key
+}
+
+/// Whether `key` is a fnox key: ASCII letters, digits and `_`, beginning with a letter or `_`
+/// (fnox's `^[A-Za-z_][A-Za-z0-9_]*$`).
+pub fn is_fnox_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 impl StoreKind {
@@ -228,6 +338,7 @@ impl StoreKind {
             StoreKind::SecureEnclave { .. } => "secure-enclave",
             StoreKind::File { .. } => "file",
             StoreKind::AgeFile { .. } => "age-file",
+            StoreKind::Fnox { .. } => "fnox",
         }
     }
 
@@ -245,6 +356,10 @@ impl StoreKind {
             StoreKind::AgeFile { .. } => {
                 "A private directory of owner-only files, one per secret, each encrypted at rest \
                  to the store's age recipients."
+            }
+            StoreKind::Fnox { .. } => {
+                "A fnox configuration, read through fnox's library: each secret name maps to one \
+                 fnox key, which fnox's providers answer. Read-only."
             }
         }
     }
@@ -347,7 +462,10 @@ pub struct SecretConfigError {
 }
 
 impl SecretConfigError {
-    fn new(problems: Vec<String>) -> Self {
+    /// A refusal of `problems`, one sentence each: how a connector that builds a store this
+    /// crate does not (`ikigai-secret-fnox`) refuses the section the same way, so a host prints
+    /// one kind of refusal at start.
+    pub fn new(problems: Vec<String>) -> Self {
         SecretConfigError { problems }
     }
 
@@ -439,8 +557,18 @@ fn no_keys(store: &str, identity: &str) -> String {
     )
 }
 
+/// The refusal of a `fnox` store its host did not build through the connector.
+fn no_connector(store: &str) -> String {
+    format!(
+        "the store {store} is a fnox store, and the host did not build it through the \
+         ikigai-secret-fnox connector, so it can read nothing; the host passes the connector's \
+         backends to SecretConfig::build_with_backends"
+    )
+}
+
 /// The backend for one store's kind. A Mac kind off a Mac cannot pass the parser; should one
-/// arrive anyway it becomes a store that refuses every operation, never a different store.
+/// arrive anyway it becomes a store that refuses every operation, never a different store. A
+/// `fnox` store is the host's to build, so here it refuses too.
 pub(crate) fn build_kind(kind: &StoreKind) -> Arc<dyn Backend> {
     match kind {
         #[cfg(target_os = "macos")]
@@ -462,6 +590,7 @@ pub(crate) fn build_kind(kind: &StoreKind) -> Arc<dyn Backend> {
             dir,
             no_keys("(unnamed)", identity),
         )),
+        StoreKind::Fnox { .. } => Arc::new(FileBackend::refusing(no_connector("(unnamed)"))),
     }
 }
 
@@ -500,9 +629,12 @@ impl SecretConfig {
     /// relative path, since a store must never depend on the working directory.
     ///
     /// Refused, each with one sentence naming the line, and all of them reported at once: an
-    /// unknown kind, a kind not built yet (`fnox`), a `keychain` or `secure-enclave` store off
+    /// unknown kind, a `keychain` or `secure-enclave` store off
     /// macOS, a setting another kind reads, an `age-file` store with no `identity`, or with a
-    /// `recipients` entry that is not an age recipient, a store name that cannot stand in an IRI,
+    /// `recipients` entry that is not an age recipient, a `fnox` store with no `config`, with
+    /// `write = true`, with an unknown `names`, with no `map` table under `names = "map"` (or one
+    /// under `escaped`), or with a table entry that is not a fnox key or that sends two names to
+    /// one key, a store name that cannot stand in an IRI,
     /// a missing `default` or one that names no store, a route to a store that is not
     /// configured, a route whose `match` is empty or not a glob, and two routes with the same
     /// `match`. A refused section applies nothing.
@@ -540,10 +672,12 @@ impl SecretConfig {
                 continue;
             }
             if let Some(kind) = check_store(name, table, home, platform, &mut problems) {
+                // A fnox store is read-only: `write = true` was refused above.
+                let fnox = matches!(kind, StoreKind::Fnox { .. });
                 stores.push(StoreSpec {
                     name: name.clone(),
                     kind,
-                    write: table.write.unwrap_or(true),
+                    write: table.write.unwrap_or(true) && !fnox,
                 });
             }
         }
@@ -786,7 +920,8 @@ impl SecretConfig {
     ///
     /// An `age-file` store needs the age keys only its host can build, so here it refuses every
     /// operation, saying so; a host with `age-file` stores calls
-    /// [`build_with_keys`](Self::build_with_keys).
+    /// [`build_with_keys`](Self::build_with_keys). A `fnox` store likewise refuses here; a host
+    /// with `fnox` stores calls [`build_with_backends`](Self::build_with_backends).
     pub fn build(self) -> RoutingBackend {
         let backends = self
             .stores
@@ -796,6 +931,9 @@ impl SecretConfig {
                     dir,
                     no_keys(&store.name, identity),
                 )) as Arc<dyn Backend>,
+                StoreKind::Fnox { .. } => {
+                    Arc::new(FileBackend::refusing(no_connector(&store.name)))
+                }
                 kind => build_kind(kind),
             })
             .collect();
@@ -808,10 +946,52 @@ impl SecretConfig {
     /// [`build`](Self::build), with the age keys the host built for each `age-file` store, by
     /// store name (from the store's `identity` and `recipients`; [`X25519Keys`](crate::X25519Keys)
     /// for identity text the host read). Refused whole, naming each store, when an `age-file`
-    /// store has no keys or keys are given for a store that is not an `age-file` store.
+    /// store has no keys or keys are given for a store that is not an `age-file` store. A `fnox`
+    /// store refuses every operation, as under [`build`](Self::build).
     pub fn build_with_keys(
         self,
+        keys: BTreeMap<String, Arc<dyn AgeKeys>>,
+    ) -> std::result::Result<RoutingBackend, SecretConfigError> {
+        self.assemble(keys, None)
+    }
+
+    /// [`build_with_keys`](Self::build_with_keys), with the backends the host built for each
+    /// `fnox` store, by store name: what `ikigai_secret_fnox::backends` answers. Refused whole,
+    /// naming each store, when a `fnox` store has no backend or a backend is given for a store
+    /// this crate builds itself or for no configured store.
+    ///
+    /// ```
+    /// use std::collections::BTreeMap;
+    /// use ikigai_secret::{SecretConfig, SecretSection};
+    ///
+    /// let section: SecretSection = toml::from_str(
+    ///     r#"
+    ///     default = "team"
+    ///     [store.team]
+    ///     kind = "fnox"
+    ///     config = "/srv/acme/fnox.toml"
+    ///     names = "escaped"
+    ///     "#,
+    /// )
+    /// .unwrap();
+    /// let config = SecretConfig::from_section(Some(&section), None).unwrap();
+    /// // A host that built no fnox backend is refused, naming the store.
+    /// let refused = config.build_with_backends(BTreeMap::new(), BTreeMap::new()).err().unwrap();
+    /// assert!(refused.problems()[0].starts_with("the store team is a fnox store, and no backend"));
+    /// ```
+    pub fn build_with_backends(
+        self,
+        keys: BTreeMap<String, Arc<dyn AgeKeys>>,
+        backends: BTreeMap<String, Arc<dyn Backend>>,
+    ) -> std::result::Result<RoutingBackend, SecretConfigError> {
+        self.assemble(keys, Some(backends))
+    }
+
+    /// Build every store, with the host's age keys and, when given, its fnox backends.
+    fn assemble(
+        self,
         mut keys: BTreeMap<String, Arc<dyn AgeKeys>>,
+        mut supplied: Option<BTreeMap<String, Arc<dyn Backend>>>,
     ) -> std::result::Result<RoutingBackend, SecretConfigError> {
         let mut problems = Vec::new();
         let mut backends = Vec::new();
@@ -821,8 +1001,33 @@ impl SecretConfig {
                     Some(key) => backends.push(Arc::new(AgeFileBackend::new(dir, key)) as _),
                     None => problems.push(format!("{}.", no_keys(&store.name, identity))),
                 },
+                StoreKind::Fnox { .. } => match supplied.as_mut() {
+                    None => backends
+                        .push(Arc::new(FileBackend::refusing(no_connector(&store.name)))
+                            as Arc<dyn Backend>),
+                    Some(supplied) => match supplied.remove(&store.name) {
+                        Some(backend) => backends.push(backend),
+                        None => problems.push(format!(
+                            "the store {} is a fnox store, and no backend was supplied for it; \
+                             the host builds it with ikigai_secret_fnox::backends.",
+                            store.name
+                        )),
+                    },
+                },
                 kind => backends.push(build_kind(kind)),
             }
+        }
+        for extra in supplied.iter().flat_map(|supplied| supplied.keys()) {
+            problems.push(match self.store(extra) {
+                Some(store) => format!(
+                    "a backend was supplied for the store {extra}, which is a {} store that \
+                     ikigai-secret builds itself.",
+                    store.kind.name()
+                ),
+                None => {
+                    format!("a backend was supplied for {extra}, which is not a configured store.")
+                }
+            });
         }
         for extra in keys.keys() {
             problems.push(match self.store(extra) {
@@ -874,14 +1079,7 @@ fn check_store(
         "secure-enclave" => &["write", "label_prefix"],
         "file" => &["write", "path"],
         "age-file" => &["write", "path", "identity", "recipients"],
-        "fnox" => {
-            problems.push(format!(
-                "`kind = {}` in {line} is not built yet in this release of ikigai-secret; use \
-                 keychain, secure-enclave, file or age-file until it lands.",
-                quoted(&table.kind)
-            ));
-            return None;
-        }
+        "fnox" => &["write", "config", "profile", "names", "map"],
         unknown => {
             problems.push(format!(
                 "`kind = {}` in {line} names no store kind; the kinds are {}.",
@@ -943,7 +1141,7 @@ fn check_store(
                 }
             }
             let dir = match table.path.as_deref() {
-                Some(path) => store_dir(path, &line, home, problems),
+                Some(path) => store_dir("path", path, &line, home, problems),
                 None => {
                     let dir = data_home_secrets(home);
                     if dir.is_none() {
@@ -965,6 +1163,7 @@ fn check_store(
                 _ => return None,
             }
         }
+        "fnox" => check_fnox(name, table, &line, home, problems)?,
         "keychain" => StoreKind::Keychain {
             service: non_empty("service", &table.service, problems)
                 .unwrap_or_else(|| DEFAULT_SERVICE.to_string()),
@@ -976,15 +1175,124 @@ fn check_store(
         _ => StoreKind::File {
             dir: match table.path.as_deref() {
                 None => None,
-                Some(path) => store_dir(path, &line, home, problems),
+                Some(path) => store_dir("path", path, &line, home, problems),
             },
         },
     };
     (problems.len() == before).then_some(kind)
 }
 
-/// A store `path` as a directory: absolute as given, or `~` and `~/…` under the host's `home`.
+/// Check a `fnox` store's own settings, pushing a problem per refusal. The settings of other
+/// kinds were refused by the caller.
+fn check_fnox(
+    name: &str,
+    table: &StoreTable,
+    line: &str,
+    home: Option<&Path>,
+    problems: &mut Vec<String>,
+) -> Option<StoreKind> {
+    let before = problems.len();
+    if table.write == Some(true) {
+        problems.push(format!(
+            "`write = true` in {line} asks a fnox store to take writes, which this release does \
+             not build: a fnox store is read-only, so leave `write` out or set it to false."
+        ));
+    }
+    let config = match table.config.as_deref() {
+        None => {
+            problems.push(format!(
+                "{line} is a fnox store with no `config`: name the one fnox configuration file \
+                 it reads, as `config = \"~/work/acme/fnox.toml\"`; a fnox store never searches \
+                 for one."
+            ));
+            None
+        }
+        Some("") => {
+            problems.push(format!(
+                "`config = \"\"` in {line} is empty; give it a value or leave it out."
+            ));
+            None
+        }
+        Some(path) => store_dir("config", path, line, home, problems),
+    };
+    let profile = match table.profile.as_deref() {
+        Some("") => {
+            problems.push(format!(
+                "`profile = \"\"` in {line} is empty; give it a value or leave it out."
+            ));
+            None
+        }
+        profile => profile.map(str::to_string),
+    };
+    let names = match (table.names.as_deref(), &table.map) {
+        (None | Some("map"), None) => {
+            problems.push(format!(
+                "{line} maps secret names with a table (`names = \"map\"`, the default) and has \
+                 no [secret.store.{name}.map] table, so it could read nothing; add the table, \
+                 secret name to fnox key, or set `names = \"escaped\"`."
+            ));
+            None
+        }
+        (None | Some("map"), Some(map)) => {
+            let mut by_key: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for (secret, key) in map {
+                if is_fnox_key(key) {
+                    by_key.entry(key).or_default().push(secret);
+                } else {
+                    problems.push(format!(
+                        "`{} = {}` in [secret.store.{name}.map] names {}, which is not a fnox \
+                         key: a fnox key is ASCII letters, digits and `_`, beginning with a \
+                         letter or `_`.",
+                        quoted(secret),
+                        quoted(key),
+                        quoted(key)
+                    ));
+                }
+            }
+            for (key, secrets) in by_key.iter().filter(|(_, secrets)| secrets.len() > 1) {
+                let quoted_names: Vec<String> = secrets.iter().map(|s| quoted(s)).collect();
+                let as_str: Vec<&str> = quoted_names.iter().map(String::as_str).collect();
+                problems.push(format!(
+                    "[secret.store.{name}.map] sends {} to the one fnox key {}, so a caller \
+                     allowed to read one of them would read the secret meant for the others; give \
+                     each name its own key.",
+                    words(&as_str),
+                    quoted(key)
+                ));
+            }
+            Some(FnoxNames::Map(map.clone()))
+        }
+        (Some("escaped"), None) => Some(FnoxNames::Escaped),
+        (Some("escaped"), Some(_)) => {
+            problems.push(format!(
+                "[secret.store.{name}.map] is read only with `names = \"map\"`, and {line} sets \
+                 `names = \"escaped\"`; remove one of them."
+            ));
+            None
+        }
+        (Some(other), _) => {
+            problems.push(format!(
+                "`names = {}` in {line} is not a name mapping; use \"map\" (an explicit \
+                 [secret.store.{name}.map] table, the default) or \"escaped\".",
+                quoted(other)
+            ));
+            None
+        }
+    };
+    if problems.len() != before {
+        return None;
+    }
+    Some(StoreKind::Fnox {
+        config: config?,
+        profile,
+        names: names?,
+    })
+}
+
+/// A store `path` (or a fnox `config`) as a path: absolute as given, or `~` and `~/…` under the
+/// host's `home`. `setting` is the line's key, for the refusal.
 fn store_dir(
+    setting: &str,
     path: &str,
     line: &str,
     home: Option<&Path>,
@@ -1004,8 +1312,8 @@ fn store_dir(
             }),
             None => {
                 problems.push(format!(
-                    "`path = {}` in {line} begins with `~`, and the host has no home directory \
-                     to read it under; give an absolute path.",
+                    "`{setting} = {}` in {line} begins with `~`, and the host has no home \
+                     directory to read it under; give an absolute path.",
                     quoted(path)
                 ));
                 None
@@ -1014,7 +1322,7 @@ fn store_dir(
         None if Path::new(path).is_absolute() => Some(PathBuf::from(path)),
         None => {
             problems.push(format!(
-                "`path = {}` in {line} is relative, and a secrets store never depends on the \
+                "`{setting} = {}` in {line} is relative, and a secrets store never depends on the \
                  working directory; give an absolute path, or one beginning with `~/`.",
                 quoted(path)
             ));
@@ -1026,6 +1334,23 @@ fn store_dir(
 // =====================================================================================
 // The routing backend.
 // =====================================================================================
+
+/// The Conflict a write to `name` in the fnox store `store` meets: the one sentence the routing
+/// backend and the connector's own backend both answer.
+///
+/// ```
+/// assert_eq!(
+///     ikigai_secret::fnox_read_only("team", "zoom.token"),
+///     "the store `team` is read-only: it is a fnox store, read through fnox's library, so \
+///      `zoom.token` cannot be written or deleted there"
+/// );
+/// ```
+pub fn fnox_read_only(store: &str, name: &str) -> String {
+    format!(
+        "the store `{store}` is read-only: it is a fnox store, read through fnox's library, so \
+         `{name}` cannot be written or deleted there"
+    )
+}
 
 /// The [`Backend`] over every configured store: each call goes to the store its name routes to
 /// ([`SecretConfig::route_for`]), and only there.
@@ -1114,6 +1439,9 @@ impl RoutingBackend {
     /// The routed backend for a write to `name`, or the refusal when its store is read-only.
     fn writable(&self, name: &str) -> Result<&Arc<dyn Backend>> {
         let (store, backend) = self.routed(name);
+        if matches!(store.kind, StoreKind::Fnox { .. }) {
+            return Err(Error::Conflict(fnox_read_only(&store.name, name)));
+        }
         if store.read_only() {
             return Err(Error::Conflict(format!(
                 "`{name}` lives in the store {}, which is read-only (`write = false`), so it \
@@ -1226,19 +1554,238 @@ mod tests {
         );
     }
 
+    fn fnox_config(text: &str) -> SecretConfig {
+        SecretConfig::from_section_on(
+            Some(&section(text)),
+            Some(Path::new("/home/svc")),
+            Platform::Other,
+        )
+        .expect("accepted")
+    }
+
     #[test]
-    fn fnox_is_an_accepted_kind_refused_as_not_built_yet() {
+    fn a_fnox_store_reads_config_profile_names_and_map() {
+        let config = fnox_config(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"~/acme/fnox.toml\"\n\
+             profile = \"prod\"\n[store.f.map]\n\"zoom.client-secret\" = \"ZOOM_SECRET\"\n\
+             \"a.b\" = \"_A_B\"\n",
+        );
+        let store = config.store("f").unwrap();
+        assert_eq!(
+            store.kind(),
+            &StoreKind::Fnox {
+                config: PathBuf::from("/home/svc/acme/fnox.toml"),
+                profile: Some("prod".into()),
+                names: FnoxNames::Map(BTreeMap::from([
+                    ("a.b".into(), "_A_B".into()),
+                    ("zoom.client-secret".into(), "ZOOM_SECRET".into()),
+                ])),
+            }
+        );
+        assert!(store.read_only(), "a fnox store is read-only");
+        assert!(!store.writable());
+        // `write = false` is accepted, and `escaped` needs no table.
+        let escaped = fnox_config(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\n\
+             names = \"escaped\"\nwrite = false\n",
+        );
+        assert!(matches!(
+            escaped.store("f").unwrap().kind(),
+            StoreKind::Fnox {
+                names: FnoxNames::Escaped,
+                profile: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_fnox_store_is_refused_a_sentence_per_problem() {
         let problems = refused(
-            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\nnames = \"map\"\n\
-             [store.f.map]\n\"a.b\" = \"A_B\"\n",
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nwrite = true\npath = \"/x\"\n\
+             profile = \"\"\n",
             Platform::Other,
         );
         assert_eq!(
             problems,
             [
-                "`kind = \"fnox\"` in [secret.store.f] is not built yet in this release of \
-              ikigai-secret; use keychain, secure-enclave, file or age-file until it lands."
+                "`path` in [secret.store.f] is not a setting of a fnox store, which reads write, \
+                 config, profile, names and map.",
+                "`write = true` in [secret.store.f] asks a fnox store to take writes, which this \
+                 release does not build: a fnox store is read-only, so leave `write` out or set it \
+                 to false.",
+                "[secret.store.f] is a fnox store with no `config`: name the one fnox \
+                 configuration file it reads, as `config = \"~/work/acme/fnox.toml\"`; a fnox \
+                 store never searches for one.",
+                "`profile = \"\"` in [secret.store.f] is empty; give it a value or leave it out.",
+                "[secret.store.f] maps secret names with a table (`names = \"map\"`, the default) \
+                 and has no [secret.store.f.map] table, so it could read nothing; add the table, \
+                 secret name to fnox key, or set `names = \"escaped\"`.",
             ]
+        );
+        let relative = refused(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"fnox.toml\"\n\
+             names = \"lossy\"\n",
+            Platform::Other,
+        );
+        assert_eq!(
+            relative,
+            [
+                "`config = \"fnox.toml\"` in [secret.store.f] is relative, and a secrets store \
+                 never depends on the working directory; give an absolute path, or one beginning \
+                 with `~/`.",
+                "`names = \"lossy\"` in [secret.store.f] is not a name mapping; use \"map\" (an \
+                 explicit [secret.store.f.map] table, the default) or \"escaped\".",
+            ]
+        );
+        let both = refused(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\n\
+             names = \"escaped\"\n[store.f.map]\n\"a\" = \"A\"\n",
+            Platform::Other,
+        );
+        assert_eq!(
+            both,
+            [
+                "[secret.store.f.map] is read only with `names = \"map\"`, and [secret.store.f] \
+              sets `names = \"escaped\"`; remove one of them."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_map_sending_two_names_to_one_key_or_naming_no_fnox_key_is_refused() {
+        let problems = refused(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\n\
+             [store.f.map]\n\"a.b\" = \"A_B\"\n\"a-b\" = \"A_B\"\n\"a_b\" = \"A_B\"\n\
+             \"c\" = \"C\"\n\"d\" = \"1D\"\n\"e\" = \"E.F\"\n",
+            Platform::Other,
+        );
+        assert_eq!(
+            problems,
+            [
+                "`\"d\" = \"1D\"` in [secret.store.f.map] names \"1D\", which is not a fnox key: \
+                 a fnox key is ASCII letters, digits and `_`, beginning with a letter or `_`.",
+                "`\"e\" = \"E.F\"` in [secret.store.f.map] names \"E.F\", which is not a fnox \
+                 key: a fnox key is ASCII letters, digits and `_`, beginning with a letter or `_`.",
+                "[secret.store.f.map] sends \"a-b\", \"a.b\" and \"a_b\" to the one fnox key \
+                 \"A_B\", so a caller allowed to read one of them would read the secret meant for \
+                 the others; give each name its own key.",
+            ]
+        );
+    }
+
+    /// Read an `escaped` key back to its name: the inverse the injectivity argument rests on.
+    fn unescape(key: &str) -> Option<String> {
+        let mut bytes = Vec::new();
+        let mut rest = key.as_bytes();
+        while let Some((&first, tail)) = rest.split_first() {
+            if first == b'_' {
+                let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+                if hex.chars().any(|c| c.is_ascii_lowercase()) {
+                    return None;
+                }
+                bytes.push(u8::from_str_radix(hex, 16).ok()?);
+                rest = &tail[2..];
+            } else {
+                bytes.push(first);
+                rest = tail;
+            }
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    #[test]
+    fn escaped_names_never_meet_and_are_always_fnox_keys() {
+        let names = [
+            "a.b",
+            "a-b",
+            "a_b",
+            "a:b",
+            "a b",
+            "A.B",
+            "ab",
+            "a_2Eb",
+            "a_2eb",
+            "_2E",
+            ".",
+            "_",
+            "1",
+            "1password",
+            "a1",
+            "x9.y",
+            "owner:id:acme:name:db",
+            "owner_3Aid",
+            "zoom.secret",
+            "zoom_secret",
+            "zoom-secret",
+            "ZOOM.SECRET",
+            "é",
+            "e\u{301}",
+            "日本",
+            "a\u{0}b",
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for name in names {
+            let key = fnox_escape(name);
+            assert!(is_fnox_key(&key), "{name:?} became {key:?}, not a fnox key");
+            assert_eq!(unescape(&key).as_deref(), Some(name), "{key:?} reads back");
+            if let Some(other) = seen.insert(key.clone(), name) {
+                panic!("{name:?} and {other:?} both reach {key:?}");
+            }
+        }
+        // Every key reads back to exactly the one name it came from, so two names never meet.
+        assert_eq!(seen.len(), names.len());
+        assert_eq!(FnoxNames::Escaped.key_for(""), None);
+        assert_eq!(FnoxNames::Escaped.name(), "escaped");
+    }
+
+    #[test]
+    fn a_fnox_store_refuses_every_write_and_reads_nothing_without_its_connector() {
+        let config = fnox_config(
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\n\
+             names = \"escaped\"\n",
+        );
+        let routing = config.clone().build();
+        for result in [
+            routing.set("zoom.token", b"x"),
+            routing.delete("zoom.token"),
+            routing.replace("zoom.token", b"x"),
+            routing.accepts_writes("zoom.token"),
+        ] {
+            assert_eq!(
+                result.unwrap_err(),
+                Error::Conflict(fnox_read_only("f", "zoom.token"))
+            );
+        }
+        let read = routing.get("zoom.token").unwrap_err().to_string();
+        assert!(read.contains("ikigai-secret-fnox connector"), "{read}");
+        // build_with_backends wants a backend for the fnox store, and none for a store built here.
+        let missing = config
+            .clone()
+            .build_with_backends(BTreeMap::new(), BTreeMap::new())
+            .err()
+            .unwrap();
+        assert_eq!(
+            missing.problems(),
+            [
+                "the store f is a fnox store, and no backend was supplied for it; the host builds \
+              it with ikigai_secret_fnox::backends."
+            ]
+        );
+        let stray: Arc<dyn Backend> = Arc::new(FileBackend::refusing("unused".into()));
+        let extra = config
+            .build_with_backends(
+                BTreeMap::new(),
+                BTreeMap::from([
+                    ("f".to_string(), Arc::clone(&stray)),
+                    ("g".to_string(), stray),
+                ]),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            extra.problems(),
+            ["a backend was supplied for g, which is not a configured store."]
         );
     }
 

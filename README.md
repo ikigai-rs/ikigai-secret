@@ -138,10 +138,12 @@ store = "local"
 ```
 
 - **Kinds.** `keychain`, `secure-enclave` (both macOS only), `file` and `age-file` (since
-  0.5.3, below) are built here. `fnox` is an accepted kind that is refused as "not built yet"
-  until its own task lands. Each kind reads only its own settings: `keychain` reads `service`,
+  0.5.3, below) are built here. `fnox` (since 0.5.4) is checked here and built by the host
+  through the `ikigai-secret-fnox` connector in this repository (see "The fnox store", below).
+  Each kind reads only its own settings: `keychain` reads `service`,
   `secure-enclave` reads `label_prefix`, `file` reads `path`, `age-file` reads `path`,
-  `identity` and `recipients`, and every kind reads `write`.
+  `identity` and `recipients`, `fnox` reads `config`, `profile`, `names` and `map`, and every
+  kind reads `write`.
 - **Refused whole.** An unknown kind, a kind not built yet, a Mac store off macOS, a setting
   of another kind, a store name that is not lowercase letters, digits, `-` and `_`, a missing
   `default` or one that names no store, a route to a store that is not configured, a `match`
@@ -260,6 +262,42 @@ age-file store (encrypted there), and the move out of a store laid out as 0.5.1 
 `tests/age_file.rs` pins the upgrade from a store as 0.5.1 wrote it (built byte for byte),
 `reencrypt` and its second run, a crash mid-reencrypt, a downgrade then a re-upgrade, the
 capability and presence order, and the new-install default.
+
+## The fnox store
+
+`kind = "fnox"` (ledger #4489, the design's section 6.1) reads secrets through fnox's library
+from ONE fnox configuration file, read-only. fnox reads files and the environment and runs
+provider commands (`op`, `aws`, `bw`), which a module crate never does, so the store lives in a
+host-role connector, [`crates/ikigai-secret-fnox`](crates/ikigai-secret-fnox/README.md), a
+separate crate in this repository's workspace. This crate checks the section and never depends
+on the connector.
+
+```toml
+[secret.store.team]
+kind = "fnox"
+config = "~/work/acme/fnox.toml"   # the one fnox file; never fnox's upward search
+profile = "prod"                   # absent: fnox's default profile, never FNOX_PROFILE
+names = "map"                      # map (the default) | escaped
+
+[secret.store.team.map]            # secret name to fnox key, one to one
+"zoom.client-secret" = "ZOOM_CLIENT_SECRET"
+```
+
+- **Names map one to one**, because a lossy mapping would let a caller allowed to read one name
+  read another's secret. `map` is an explicit table: an unlisted name is NotFound, and a table
+  sending two names to one key, or naming something that is not a fnox key, is refused at start.
+  `escaped` is `fnox_escape`: ASCII letters pass, digits pass after the first character, and
+  every other character, `_` included, becomes `_` and two hex digits per UTF-8 byte
+  (`zoom.client-secret` is `zoom_2Eclient_2Dsecret`).
+- **Read-only.** Every write to a name routed to a fnox store is Conflict ("the store `team` is
+  read-only: …"), after every capability check, and a copy into one is refused. A copy OUT of
+  one, into an `age-file` or `file` store, works.
+- **The host builds it.** `SecretConfig::build_with_backends(keys, backends)` takes the
+  connector's backends by store name (`ikigai_secret_fnox::backends(&config)`, or
+  `ikigai_secret_fnox::routing(config, keys)` for both steps); `build` and `build_with_keys` leave
+  a fnox store refusing every read, saying so.
+- **Never interactive, and errors never carry fnox's text.** See the connector's README, which
+  also lists what fnox still reads from the host's environment.
 
 **The other direction: ikigai as a fnox provider.** `contrib/fnox/ikigai.lua` is a fnox Lua
 plugin whose `get` reads a fnox secret through `ikigai --quiet -c 'source urn:secret:<name>'`, so
@@ -400,6 +438,24 @@ endpoint; before, one keyed by `secret` was silently ignored. The conformance su
   check, and a refusal is its answer with nothing deleted. Under `space(backend)` on a Mac that
   is a Touch ID prompt per delete, so a host deleting unattended injects its own gate through
   `space_with_gate`. A refused-by-capability delete never asks.
+
+## 0.5.4
+
+The fnox read store (ledger #4489), the next step of configurable secret storage (epic ledger
+#4485), and the repository becomes a workspace. Additive, so a patch: nothing a 0.5.3 host calls
+changes behavior, and the crate's name, files and API are where they were.
+
+- `kind = "fnox"` is accepted: `StoreKind::Fnox`, `FnoxNames`, `fnox_escape`, `is_fnox_key`
+  and `fnox_read_only`, with the `config`, `profile`, `names` and `map` settings and their
+  refusals (no `config`, a relative one, `write = true`, an unknown `names`, a missing or
+  misplaced `map`, a key that is not a fnox key, two names sent to one key). A fnox store is
+  always read-only.
+- `SecretConfig::build_with_backends(keys, backends)`: `build_with_keys` plus the host's
+  backends for the stores this crate does not build. `SecretConfigError::new` is public, so a
+  connector refuses the same way.
+- A copy into a fnox store is refused with its own sentence.
+- New crate in the workspace: `ikigai-secret-fnox` 0.1.0 (`crates/ikigai-secret-fnox`), the
+  host-role connector. This crate does not depend on it.
 
 ## 0.5.3
 

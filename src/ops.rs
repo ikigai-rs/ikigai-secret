@@ -252,6 +252,12 @@ impl Endpoint for Copy {
                  nothing can be copied from it"
             )));
         }
+        if matches!(target.kind(), StoreKind::Fnox { .. }) {
+            return Err(Error::Conflict(format!(
+                "the store {to} is a fnox store, which is read-only, so nothing can be copied \
+                 into it"
+            )));
+        }
         if target.read_only() {
             return Err(Error::Conflict(format!(
                 "the store {to} is read-only (`write = false`), so nothing can be copied into it"

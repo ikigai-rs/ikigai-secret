@@ -4,7 +4,9 @@ Design spike for ledger #3748 (fnox, both directions), widened to the ask behind
 options for where secrets are stored, as soon as possible. Status: **decided** (Brian, 2026-11-27;
 section 9). Section 10's task 1 (stores and routes, ledger #4486) and task 7 (the fnox Lua
 plugin's `get`, ledger #4492) are built for 0.5.2, and task 3 (`age-file`, ledger #4488) and
-task 6 (copy between stores, ledger #4491) for 0.5.3; the rest are filed.
+task 6 (copy between stores, ledger #4491) for 0.5.3, and task 4 (the fnox read store, ledger
+#4489, the `ikigai-secret-fnox` connector) for 0.5.4; the rest are filed. Section 6.1's open
+question is settled there: see "As built" at its end.
 
 References are to this repository at `b083c84` (0.5.1) and to fnox 1.50.0 (released 2026-11-18,
 MIT, <https://fnox.jdx.dev>, <https://github.com/jdx/fnox>). The fnox facts below were read from
@@ -171,6 +173,37 @@ publishes one: crate `fnox` 1.50.0 exposes `Fnox::open(path)`, `with_profile(..)
   those as its own opt-in features, so a host builds only the providers it uses.
 - **Errors.** A provider failure is a refusal naming the store and the provider kind, never the
   key's value and never fnox's raw error text when that text can carry a value or a token.
+
+**As built (0.5.4, ledger #4489).** `crates/ikigai-secret-fnox`, read-only, offline-tested with
+fnox's `age` and `plain` providers. Where it departs from or adds to the text above:
+
+- **fnox-core, not fnox.** The library (`Fnox`, `get`, `list`) lives in the `fnox-core` crate;
+  the `fnox` crate re-exports it beside the whole command-line program (a terminal UI, an MCP
+  server, a clipboard, an HTTP proxy). The connector depends on `fnox-core` with
+  `default-features = false`, and offers fnox's seven feature families as its own.
+- **The open question, settled.** Prompting is turned off through the library by
+  `fnox_core::env::set_non_interactive(true)`, a process-wide switch the store sets when it opens
+  and before every read. It covers the sign-in prompt, a passphrase-protected age identity and
+  every provider that needs a person at the machine. `prompt_auth = false` in the file alone is
+  not enough: `FNOX_PROMPT_AUTH=true` in the environment overrides it, and it does not reach the
+  age passphrase prompt. The test opens a passphrase-protected identity and sees the refusal at
+  once.
+- **The profile is always set**, to the section's or to fnox's default, so `FNOX_PROFILE` in the
+  host's environment never picks it; a profile name fnox would silently drop (a `/`, a comma) is
+  refused at start rather than falling back to the default.
+- **The `escaped` mapping escapes a leading digit too** (`1password` is `_31password`), since a
+  fnox key cannot begin with one; still injective. A character outside ASCII is escaped byte by
+  byte in UTF-8.
+- **A provider's "no such item"** (`ProviderSecretNotFound`) is NotFound as well, beside
+  `SecretNotFound` and `Ok(None)`.
+- **What fnox still reads from the environment**, which the store cannot stop: a declared key
+  with no value and no default falls back to the environment variable of the same name (pinned by
+  `tests/env_fallback.rs`), and `FNOX_AGE_KEY`, `FNOX_AGE_IDENTITY`, `FNOX_IF_MISSING`,
+  `FNOX_IF_MISSING_DEFAULT`, `FNOX_CONFIG_DIR` and the XDG variables change what a read does. The
+  config-home rule says no environment; a host that mounts a fnox store controls its environment
+  instead.
+- **No timeout.** A provider command that hangs on its network hangs the read; non-interactive
+  mode stops prompts, not slow providers.
 
 ### 6.2 fnox writes
 

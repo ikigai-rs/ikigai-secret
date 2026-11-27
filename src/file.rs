@@ -100,7 +100,6 @@ impl FileBackend {
     }
 
     /// A backend that refuses every operation with `why`: a store that cannot be built here.
-    #[cfg(not(target_os = "macos"))]
     pub(crate) fn refusing(why: String) -> Self {
         FileBackend { dir: Err(why) }
     }
