@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-secret"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Secrets for ikigai (urn:secret:*): resolve and store secrets through the OS keystore, capability-gated. macOS Keychain backend on a Mac; a dev file backend elsewhere. The first slice of the pluggable secrets facade."
@@ -21,6 +21,15 @@ categories = ["os"]
 ikigai-core = "0.4.1"
 # Endpoint::invoke is async (dyn via async-trait).
 async-trait = "0.1"
+# The `[secret]` section (ledger #4486) is `Deserialize`, as core's `CacheConfig` is: the host
+# reads its config.toml and deserializes the table; this crate reads no file.
+serde = { version = "1", features = ["derive"] }
+# The inspection resources' `application/json` face.
+serde_json = "1"
+# A route's `match` is a glob on the full secret name (`*`, `?`, `[...]`): rust-lang's `glob`
+# crate, no dependencies, rather than a matcher written here. `Pattern::new`/`matches` and the
+# public `PatternError::msg` are 0.3 API.
+glob = "0.3"
 
 # Ed25519 key generation for `urn:secret:generate`. PKCS8 (private) + SPKI (public)
 # PEM encoding — the same standard encodings ikigai-sign reads via `key=urn:secret:<name>`.
@@ -61,6 +70,9 @@ libc = "0.2"
 ikigai-resolve = "0.6.0"
 futures = "0.3"
 tempfile = "3"
+# Test-only: the `[secret]` section is deserialized from real TOML in the tests and doctests, as a
+# host would (`toml::from_str`). The library itself reads no TOML.
+toml = "0.8"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound endpoint and
 # reports every violation at once. 0.12.0 adds BODIES (the buffered and body faces of an action
 # agree; probed through `Suite::body_space`) and BODY-INPUTS (an argument declared `reads_body`

@@ -45,6 +45,15 @@
 //! the keystore, so an ungranted caller cannot learn whether a name exists; a secret read
 //! is never cacheable. `tests/conformance.rs` holds all of that to `ikigai-conformance`.
 //!
+//! **Stores and routes** (ledger #4486, `docs/storage-backends.md`): a host's `[secret]` section
+//! names several stores and routes secret names to them by glob. The host deserializes the
+//! section into a [`SecretSection`]; [`SecretConfig::from_section`] checks it, refusing a wrong
+//! one whole with a sentence per problem; [`SecretConfig::build`] makes the [`RoutingBackend`];
+//! [`routed_space`] mounts it with four inspection resources under `urn:cap:secret:inspect`
+//! (where a name lives under the name's own read scope). With no section the configuration is
+//! exactly [`default_backend`]'s one store. Every capability check still happens before any store
+//! is consulted, and a route never widens a scope.
+//!
 //! A secret's name never begins with `-`: there it would put the `-` where a capability scope
 //! marks an exclusion, which no grant can cover (`ikigai_core::is_deny_scope`, core 0.1.86).
 //! Every face, the file store included, refuses such a name before any capability check.
@@ -58,7 +67,16 @@ use ikigai_core::{
 };
 
 mod file;
+mod inspect;
+mod store;
 pub use file::FileBackend;
+pub use inspect::{
+    INSPECT_SCOPE, ROUTE_IRI, ROUTE_SECRET_TEMPLATE, STORE_IRI, STORE_NAME_TEMPLATE,
+};
+pub use store::{
+    RouteSpec, RouteTable, Routed, RoutingBackend, SecretConfig, SecretConfigError, SecretSection,
+    StoreKind, StoreSpec, StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
+};
 
 /// A secret store: get / set / delete a named secret's bytes. Implemented by the OS
 /// keystore (macOS Keychain) or a dev file store; a host uses it directly (a relying
@@ -127,6 +145,23 @@ pub trait Backend: Send + Sync {
     fn generate_signing_key(&self, name: &str) -> Result<Option<(String, Vec<u8>)>> {
         let _ = name;
         Ok(None)
+    }
+
+    /// Whether a write to `name` (a Sink, a Delete, a generate) can go ahead here: `Ok(())`, or
+    /// the refusal the write would meet. The resource faces ask it after every capability check
+    /// and BEFORE the presence gate, so nobody is asked to prove presence for a write that is
+    /// refused anyway. The default accepts; [`RoutingBackend`] refuses a name routed to a
+    /// read-only store. ⚠ A backend that WRAPS another must forward it, or it gets the default.
+    fn accepts_writes(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// One line on whether the store can be reached now, for `urn:secret:store:name:{store}`:
+    /// never a path, an account, a token or a value, and never read from a secret. The default
+    /// probes nothing. [`FileBackend`] judges its directory.
+    fn health(&self) -> String {
+        "not probed: this store is asked only when a request reaches it".to_string()
     }
 }
 
@@ -258,15 +293,11 @@ pub fn der_ecdsa_to_fixed_rs(der: &[u8]) -> Result<[u8; 64]> {
 
 /// The default backend for this platform: the macOS Keychain, else a dev file store
 /// (which is **not** hardware-backed — a Mac deployment gets the Keychain).
+///
+/// It is the one store a host with no `[secret]` section gets:
+/// [`SecretConfig::from_section`]`(None, …)` names the same store, built by the same function.
 pub fn default_backend() -> Arc<dyn Backend> {
-    #[cfg(target_os = "macos")]
-    {
-        Arc::new(KeychainBackend::new("ikigai-secret"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Arc::new(FileBackend::in_data_dir_or_refusing())
-    }
+    store::build_kind(store::platform_store().kind())
 }
 
 /// The `urn:secret:*` space over `backend`, gated by the platform's [`BiometricGate`]. Mount
@@ -316,7 +347,66 @@ pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
 /// assert_eq!(unlock(&kernel).unwrap().bytes, b"unlocked");
 /// ```
 pub fn space_with_gate(backend: Arc<dyn Backend>, gate: Arc<dyn PresenceGate>) -> EndpointSpace {
-    EndpointSpace::new()
+    secret_space(backend, gate, None)
+}
+
+/// The `urn:secret:*` space over a [`RoutingBackend`], gated by the platform's
+/// [`BiometricGate`]: [`routed_space_with_gate`] with that gate.
+pub fn routed_space(routing: Arc<RoutingBackend>) -> EndpointSpace {
+    routed_space_with_gate(routing, Arc::new(BiometricGate))
+}
+
+/// The `urn:secret:*` space over a [`RoutingBackend`], proving presence through `gate`: every
+/// face of [`space_with_gate`], each name answered by the store it routes to, plus the four
+/// inspection resources (`docs/storage-backends.md`, section 4), bound EXACTLY or by their own
+/// templates ahead of `urn:secret:{name}`:
+///
+/// - [`STORE_IRI`] (`urn:secret:store`): every configured store's name, kind, whether it can be
+///   written, and a sentence on what it is. Under [`INSPECT_SCOPE`].
+/// - [`STORE_NAME_TEMPLATE`] (`urn:secret:store:name:{store}`): the same for one store, plus a
+///   health line. Under [`INSPECT_SCOPE`].
+/// - [`ROUTE_IRI`] (`urn:secret:route`): the ordered routes and the default. Under
+///   [`INSPECT_SCOPE`].
+/// - [`ROUTE_SECRET_TEMPLATE`] (`urn:secret:route:secret:{name}`): the store one name routes to,
+///   from the route table alone, never by asking a store. Under the name's own read scope,
+///   `urn:cap:secret:read:<name>`.
+///
+/// None of them ever names a path, an account, a token or a value. The names they are bound at
+/// (`store`, `route`, and every name beginning `store:name:` or `route:secret:`) are never a
+/// secret's in this space, and generate refuses to mint into them.
+///
+/// ```
+/// use std::sync::Arc;
+/// use ikigai_core::{Capability, Iri, Kernel, Request, Verb};
+/// use ikigai_secret::{routed_space_with_gate, SecretConfig, INSPECT_SCOPE, ROUTE_IRI};
+///
+/// // No `[secret]` section: today's one platform store, inspectable.
+/// let routing = Arc::new(SecretConfig::from_section(None, None).unwrap().build());
+/// let kernel = Kernel::new(Arc::new(routed_space_with_gate(routing, Arc::new(|_: &str| Ok(())))));
+/// let read = |cap: &Capability| {
+///     let request = Request::new(Verb::Source, Iri::parse(ROUTE_IRI).unwrap());
+///     futures::executor::block_on(kernel.issue(request, cap))
+/// };
+/// let inspect = Capability::scoped([INSPECT_SCOPE.to_string()]);
+/// let routes = String::from_utf8(read(&inspect).unwrap().bytes).unwrap();
+/// assert!(routes.starts_with("No routes are configured."));
+/// assert!(read(&Capability::scoped(Vec::<String>::new())).is_err());
+/// ```
+pub fn routed_space_with_gate(
+    routing: Arc<RoutingBackend>,
+    gate: Arc<dyn PresenceGate>,
+) -> EndpointSpace {
+    secret_space(routing.clone(), gate, Some(routing))
+}
+
+/// The faces over `backend`, with the inspection resources ahead of the template when `routing`
+/// is given (the routed space; it is the same backend).
+fn secret_space(
+    backend: Arc<dyn Backend>,
+    gate: Arc<dyn PresenceGate>,
+    routing: Option<Arc<RoutingBackend>>,
+) -> EndpointSpace {
+    let mut space = EndpointSpace::new()
         .bind(
             Exact::new(UNLOCK_IRI),
             UnlockEndpoint {
@@ -328,12 +418,16 @@ pub fn space_with_gate(backend: Arc<dyn Backend>, gate: Arc<dyn PresenceGate>) -
             GenerateEndpoint {
                 backend: Arc::clone(&backend),
                 gate: Arc::clone(&gate),
+                inspect: routing.is_some(),
             },
-        )
-        .bind(
-            UriTemplate::parse("urn:secret:{name}").expect("valid template"),
-            SecretEndpoint { backend, gate },
-        )
+        );
+    if let Some(routing) = routing {
+        space = inspect::bind(space, routing);
+    }
+    space.bind(
+        UriTemplate::parse("urn:secret:{name}").expect("valid template"),
+        SecretEndpoint { backend, gate },
+    )
 }
 
 /// [`space`] over [`default_backend`].
@@ -455,6 +549,15 @@ pub const GENERATE_IRI: &str = "urn:secret:generate";
 /// The names the reserved operations take from the `{name}` template: never a secret's name.
 const RESERVED: [&str; 2] = ["unlock", "generate"];
 
+/// Whether `name` is taken from the `{name}` template by an inspection resource of the routed
+/// space ([`routed_space_with_gate`]): `store`, `route`, or a name under either's template.
+fn is_inspection_name(name: &str) -> bool {
+    name == "store"
+        || name == "route"
+        || name.starts_with("store:name:")
+        || name.starts_with("route:secret:")
+}
+
 /// Refuse a secret name that begins with `-`, naming `arg` (the input it arrived in).
 ///
 /// A secret's name is the last segment of its scopes, `urn:cap:secret:read:<name>` and
@@ -534,6 +637,9 @@ impl Endpoint for SecretEndpoint {
                 // Any bytes: the read face serves `application/octet-stream`, so the write face
                 // takes exactly what it may hand back (a binary key, not only text).
                 let value = inv.inline_arg("content")?;
+                // A store that takes no writes (a read-only route) refuses here, after the
+                // capability check, so an ungranted caller never learns where the name lives.
+                self.backend.accepts_writes(&name)?;
                 // `replace`, never a delete here followed by a set: how a store replaces is
                 // the store's to say. The file store renames a fully written file over the old
                 // one, so a failed write keeps the previous secret; the Keychain deletes and
@@ -572,6 +678,9 @@ impl Endpoint for SecretEndpoint {
                         format!("deleting `{name}` requires `{scope}`").into(),
                     ));
                 }
+                // A store that takes no writes refuses before the gate, so nobody proves
+                // presence for a delete that cannot happen.
+                self.backend.accepts_writes(&name)?;
                 // Then presence, after every capability and argument check (a refused caller
                 // never reaches the gate) and before the keystore: the gate's refusal is the
                 // answer, and nothing is deleted. Asked whether or not the name holds a
@@ -605,7 +714,8 @@ impl Endpoint for SecretEndpoint {
         Description::new("secret")
             .summary(
                 "Read (Source), store (Sink), test for (Exists) or remove (Delete) a named secret \
-                 in the OS keystore (macOS Keychain; a file store elsewhere), capability-gated PER \
+                 in the store its name routes to (by default the macOS Keychain on a Mac and a file \
+                 store elsewhere), capability-gated PER \
                  NAME: `urn:cap:secret:read:<name>` (Source, Exists) / \
                  `urn:cap:secret:write:<name>` (Sink) / `urn:cap:secret:delete:<name>` (Delete), \
                  default-deny, refused before the keystore is consulted. A Sink stores the piped \
@@ -709,6 +819,8 @@ impl Endpoint for UnlockEndpoint {
 struct GenerateEndpoint {
     backend: Arc<dyn Backend>,
     gate: Arc<dyn PresenceGate>,
+    /// Whether the inspection resources share the space, so their names are reserved too.
+    inspect: bool,
 }
 
 impl GenerateEndpoint {
@@ -801,6 +913,20 @@ impl Endpoint for GenerateEndpoint {
                 ),
             });
         }
+        if self.inspect {
+            if let Some(taken) = [&key, &public]
+                .into_iter()
+                .find(|name| is_inspection_name(name))
+            {
+                return Err(Error::InvalidArgument {
+                    name: "into".into(),
+                    detail: format!(
+                        "`{taken}` names the inspection resource `urn:secret:{taken}`, never a \
+                         secret"
+                    ),
+                });
+            }
+        }
         // Generate WRITES two secrets, so it needs the write authority over both that a Sink
         // of each would. The kernel enforced the declared `urn:cap:secret:write:*` floor;
         // these are the exact names behind it.
@@ -816,6 +942,10 @@ impl Endpoint for GenerateEndpoint {
                     .into(),
                 ));
             }
+        }
+        // A store that takes no writes refuses either name before the prompt.
+        for name in [&key, &public] {
+            self.backend.accepts_writes(name)?;
         }
         // And it never replaces: a name already holding either half is refused, before the
         // biometric prompt. Rotating a key is minting a new name.
@@ -1122,7 +1252,11 @@ mod tests {
                 gate: gate.clone(),
             }),
             Box::new(UnlockEndpoint { gate: gate.clone() }),
-            Box::new(GenerateEndpoint { backend, gate }),
+            Box::new(GenerateEndpoint {
+                backend,
+                gate,
+                inspect: false,
+            }),
         ];
         let names: Vec<(String, String)> = endpoints
             .iter()
