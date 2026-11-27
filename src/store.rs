@@ -65,15 +65,16 @@ use std::sync::Arc;
 use ikigai_core::{Error, Result};
 use serde::Deserialize;
 
-use crate::{Backend, FileBackend, Signed};
+use crate::age_file::{recipient_kind, AgeFileBackend, AgeKeys, HOST_DEFAULT_IDENTITY};
+use crate::{Backend, FileBackend, Reencrypted, Signed};
 
 /// The Keychain service, and the Secure Enclave label prefix, a store gets when its table names
 /// none: the one [`default_backend`](crate::default_backend) has always used.
 pub const DEFAULT_SERVICE: &str = "ikigai-secret";
 
 /// Every store kind the `[secret]` section can name, in the order a refusal lists them. The
-/// first three are built here; `age-file` and `fnox` are accepted by the parser and refused as
-/// not built yet until their tasks land.
+/// first four are built here (`age-file` since 0.5.3, ledger #4488); `fnox` is accepted by the
+/// parser and refused as not built yet until its task lands.
 pub const STORE_KINDS: [&str; 5] = ["keychain", "secure-enclave", "file", "age-file", "fnox"];
 
 /// The thread every cacheable inspection answer hangs from. The configuration is read once, at
@@ -95,6 +96,12 @@ pub const CONFIG_THREAD: &str = "urn:secret:config";
 /// [secret.store.keychain]
 /// kind = "keychain"                   # keychain | secure-enclave | file | age-file | fnox
 /// service = "ikigai-secret"           # keychain: the Keychain service (the default)
+///
+/// [secret.store.server]
+/// kind = "age-file"                   # each item age-encrypted at rest
+/// path = "/srv/ikigai/secrets"        # absent: the data home's `secrets` directory
+/// identity = "file:/etc/ikigai/age"   # where the HOST gets the age identity from
+/// recipients = ["age1…"]              # more recipients every item is sealed to (recovery)
 ///
 /// [secret.store.local]
 /// kind = "file"
@@ -138,13 +145,19 @@ pub struct StoreTable {
     /// `secure-enclave`: the prefix of its keys' labels ([`DEFAULT_SERVICE`] when absent).
     #[serde(default)]
     pub label_prefix: Option<String>,
-    /// `file` (and `age-file`, not built yet): the store directory. Absent for `file`, today's
-    /// place: `IKIGAI_SECRETS` when set, else the data home's `secrets` directory.
+    /// `file` and `age-file`: the store directory. Absent for `file`, today's place:
+    /// `IKIGAI_SECRETS` when set, else the data home's `secrets` directory. Absent for `age-file`,
+    /// the data home's `secrets` directory (never `IKIGAI_SECRETS`, which is deprecated).
     #[serde(default)]
     pub path: Option<String>,
-    /// `age-file` (not built yet): where the age identity comes from.
+    /// `age-file`: where the age identity comes from, which the HOST resolves (a file, a system
+    /// credential, an age plugin). Required.
     #[serde(default)]
     pub identity: Option<String>,
+    /// `age-file`: more age recipients every item is sealed to, besides the identity's own (a
+    /// recovery key kept off the machine). Each is an `age1…` recipient, X25519 or a plugin's.
+    #[serde(default)]
+    pub recipients: Option<Vec<String>>,
     /// `fnox` (not built yet): the one fnox configuration file.
     #[serde(default)]
     pub config: Option<String>,
@@ -196,6 +209,15 @@ pub enum StoreKind {
         /// The directory, or `None` for today's place (`IKIGAI_SECRETS`, else the data home).
         dir: Option<PathBuf>,
     },
+    /// The file store's layout with each item age-encrypted ([`AgeFileBackend`]).
+    AgeFile {
+        /// The directory.
+        dir: PathBuf,
+        /// Where the host gets the age identity from, as the section spells it.
+        identity: String,
+        /// The configured recipients beyond the identity's own, as the section spells them.
+        recipients: Vec<String>,
+    },
 }
 
 impl StoreKind {
@@ -205,6 +227,7 @@ impl StoreKind {
             StoreKind::Keychain { .. } => "keychain",
             StoreKind::SecureEnclave { .. } => "secure-enclave",
             StoreKind::File { .. } => "file",
+            StoreKind::AgeFile { .. } => "age-file",
         }
     }
 
@@ -218,6 +241,10 @@ impl StoreKind {
             }
             StoreKind::File { .. } => {
                 "A private directory of owner-only files, one per secret, not encrypted at rest."
+            }
+            StoreKind::AgeFile { .. } => {
+                "A private directory of owner-only files, one per secret, each encrypted at rest \
+                 to the store's age recipients."
             }
         }
     }
@@ -380,6 +407,38 @@ pub(crate) fn platform_store() -> StoreSpec {
     }
 }
 
+/// What a host with no `[secret]` section finds already on this machine
+/// ([`found_install`](crate::found_install)), which [`SecretConfig::for_host`] turns into a store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Found {
+    /// No store yet: a new install, which gets an `age-file` store.
+    Nothing,
+    /// An install from before (Keychain items, a file store with secrets in it, or
+    /// `IKIGAI_SECRETS` set), which keeps its store unchanged.
+    Existing,
+    /// The `age-file` store an earlier start of a new install made (its marker is there).
+    AgeFile,
+}
+
+/// The data home's `secrets` directory under `home`, when `home` is absolute.
+pub(crate) fn data_home_secrets(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home.filter(|home| home.is_absolute())?;
+    ikigai_core::config::data_home_from(Some(home.as_os_str().to_os_string()))
+        .and_then(|data| ikigai_core::config::data_path_in(&data, "secrets"))
+        .filter(|dir| dir.is_absolute())
+}
+
+/// The refusal of an `age-file` store its host built no keys for.
+fn no_keys(store: &str, identity: &str) -> String {
+    format!(
+        "the store {store} is an age-file store, and the host was not given its age identity \
+         (identity = {}), so it can neither read nor write a secret; the host builds its keys \
+         and passes them to SecretConfig::build_with_keys",
+        quoted(identity)
+    )
+}
+
 /// The backend for one store's kind. A Mac kind off a Mac cannot pass the parser; should one
 /// arrive anyway it becomes a store that refuses every operation, never a different store.
 pub(crate) fn build_kind(kind: &StoreKind) -> Arc<dyn Backend> {
@@ -399,6 +458,10 @@ pub(crate) fn build_kind(kind: &StoreKind) -> Arc<dyn Backend> {
         }
         StoreKind::File { dir: Some(dir) } => Arc::new(FileBackend::new(dir)),
         StoreKind::File { dir: None } => Arc::new(FileBackend::in_data_dir_or_refusing()),
+        StoreKind::AgeFile { dir, identity, .. } => Arc::new(AgeFileBackend::without_keys(
+            dir,
+            no_keys("(unnamed)", identity),
+        )),
     }
 }
 
@@ -428,15 +491,18 @@ impl SecretConfig {
     /// Check a `[secret]` section for this platform.
     ///
     /// `None` (the host's `config.toml` has no `[secret]` section) answers exactly today's
-    /// [`default_backend`](crate::default_backend): one store, the Keychain under
+    /// [`default_backend`](crate::default_backend), the store an EXISTING install keeps (a host
+    /// that also tells a new install from an old one calls [`for_host`](Self::for_host)): one
+    /// store, the Keychain under
     /// [`DEFAULT_SERVICE`] on a Mac and the file store in today's place elsewhere, as the
     /// default, with no routes. `home` is the home directory the host resolved, which a store
     /// `path` beginning with `~/` is read under; a `~` path with no home is refused, and so is a
     /// relative path, since a store must never depend on the working directory.
     ///
     /// Refused, each with one sentence naming the line, and all of them reported at once: an
-    /// unknown kind, a kind not built yet (`age-file`, `fnox`), a `keychain` or `secure-enclave`
-    /// store off macOS, a setting another kind reads, a store name that cannot stand in an IRI,
+    /// unknown kind, a kind not built yet (`fnox`), a `keychain` or `secure-enclave` store off
+    /// macOS, a setting another kind reads, an `age-file` store with no `identity`, or with a
+    /// `recipients` entry that is not an age recipient, a store name that cannot stand in an IRI,
     /// a missing `default` or one that names no store, a route to a store that is not
     /// configured, a route whose `match` is empty or not a glob, and two routes with the same
     /// `match`. A refused section applies nothing.
@@ -576,6 +642,97 @@ impl SecretConfig {
         }
     }
 
+    /// The configuration for a host: its `[secret]` section when it has one, else the store this
+    /// machine already uses, or an `age-file` store for a new install (`docs/storage-backends.md`
+    /// section 9, decision 5). `found` is what [`found_install`](crate::found_install) answered.
+    ///
+    /// - A section: exactly [`from_section`](Self::from_section); `found` is not consulted.
+    /// - No section and [`Found::Existing`]: today's store, as `from_section(None, …)`, unchanged.
+    ///   [`notice`](Self::notice) then has the one line the host prints at start.
+    /// - No section and [`Found::Nothing`] or [`Found::AgeFile`]: one `age-file` store, named
+    ///   `age-file`, in the data home's `secrets` directory under `home`, whose identity is the
+    ///   host's own default ([`HOST_DEFAULT_IDENTITY`]) and with no further recipients. Refused
+    ///   when there is no absolute `home` to place it under.
+    ///
+    /// ```
+    /// use ikigai_secret::{Found, SecretConfig, StoreKind, HOST_DEFAULT_IDENTITY};
+    ///
+    /// let new = SecretConfig::for_host(None, Some("/home/svc".as_ref()), Found::Nothing).unwrap();
+    /// assert_eq!(new.default_store(), "age-file");
+    /// assert!(matches!(
+    ///     new.stores()[0].kind(),
+    ///     StoreKind::AgeFile { identity, .. } if identity == HOST_DEFAULT_IDENTITY
+    /// ));
+    /// assert_eq!(new.notice(), None);
+    ///
+    /// let old = SecretConfig::for_host(None, Some("/home/svc".as_ref()), Found::Existing).unwrap();
+    /// assert_eq!(old, SecretConfig::from_section(None, Some("/home/svc".as_ref())).unwrap());
+    /// assert!(old.notice().unwrap().contains("age-file"));
+    /// ```
+    pub fn for_host(
+        section: Option<&SecretSection>,
+        home: Option<&Path>,
+        found: Found,
+    ) -> std::result::Result<Self, SecretConfigError> {
+        Self::for_host_on(section, home, found, Platform::current())
+    }
+
+    pub(crate) fn for_host_on(
+        section: Option<&SecretSection>,
+        home: Option<&Path>,
+        found: Found,
+        platform: Platform,
+    ) -> std::result::Result<Self, SecretConfigError> {
+        if section.is_some() || found == Found::Existing {
+            return Self::from_section_on(section, home, platform);
+        }
+        let dir = data_home_secrets(home).ok_or_else(|| {
+            SecretConfigError::new(vec![
+                "There is no [secret] section and no secrets store yet, so a new age-file store \
+                 would be made in the data home, and the host has no absolute home directory to \
+                 put it under; set HOME, or add a [secret] section naming the store's path."
+                    .to_string(),
+            ])
+        })?;
+        let kind = StoreKind::AgeFile {
+            dir,
+            identity: HOST_DEFAULT_IDENTITY.to_string(),
+            recipients: Vec::new(),
+        };
+        let store = StoreSpec {
+            name: kind.name().to_string(),
+            kind,
+            write: true,
+        };
+        Ok(SecretConfig {
+            default: store.name.clone(),
+            stores: vec![store],
+            routes: Vec::new(),
+            configured: false,
+        })
+    }
+
+    /// The one line a host prints at start when it has no `[secret]` section and keeps an
+    /// existing install's store: that `age-file` is now the default for new installs, how to move
+    /// to it, and that `IKIGAI_SECRETS` is deprecated. `None` for every other configuration.
+    pub fn notice(&self) -> Option<String> {
+        if self.configured {
+            return None;
+        }
+        let store = self.stores.first()?;
+        if matches!(store.kind, StoreKind::AgeFile { .. }) {
+            return None;
+        }
+        Some(format!(
+            "ikigai-secret: secrets stay in the {} store, as before. New installs now get an \
+             age-file store, which encrypts each secret at rest; to move to one, add a [secret] \
+             section with an age-file store and copy each secret into it with \
+             urn:secret:store:name:{{store}}:copy. IKIGAI_SECRETS is deprecated: name the store's \
+             path in the [secret] section instead.",
+            store.kind.name()
+        ))
+    }
+
     /// Whether this configuration came from a `[secret]` section (`false`: today's default).
     pub fn is_configured(&self) -> bool {
         self.configured
@@ -623,18 +780,69 @@ impl SecretConfig {
     }
 
     /// Build every store this configuration names (the kinds built here: `keychain`,
-    /// `secure-enclave`, `file`) and the [`RoutingBackend`] over them. Constructing a store
-    /// opens nothing: a Keychain backend holds its service name, a file backend its directory,
-    /// until a request reaches it.
+    /// `secure-enclave`, `file`, `age-file`) and the [`RoutingBackend`] over them. Constructing a
+    /// store opens nothing: a Keychain backend holds its service name, a file backend its
+    /// directory, until a request reaches it.
+    ///
+    /// An `age-file` store needs the age keys only its host can build, so here it refuses every
+    /// operation, saying so; a host with `age-file` stores calls
+    /// [`build_with_keys`](Self::build_with_keys).
     pub fn build(self) -> RoutingBackend {
         let backends = self
             .stores
             .iter()
-            .map(|store| build_kind(&store.kind))
+            .map(|store| match &store.kind {
+                StoreKind::AgeFile { dir, identity, .. } => Arc::new(AgeFileBackend::without_keys(
+                    dir,
+                    no_keys(&store.name, identity),
+                )) as Arc<dyn Backend>,
+                kind => build_kind(kind),
+            })
             .collect();
         RoutingBackend {
             config: self,
             backends,
+        }
+    }
+
+    /// [`build`](Self::build), with the age keys the host built for each `age-file` store, by
+    /// store name (from the store's `identity` and `recipients`; [`X25519Keys`](crate::X25519Keys)
+    /// for identity text the host read). Refused whole, naming each store, when an `age-file`
+    /// store has no keys or keys are given for a store that is not an `age-file` store.
+    pub fn build_with_keys(
+        self,
+        mut keys: BTreeMap<String, Arc<dyn AgeKeys>>,
+    ) -> std::result::Result<RoutingBackend, SecretConfigError> {
+        let mut problems = Vec::new();
+        let mut backends = Vec::new();
+        for store in &self.stores {
+            match &store.kind {
+                StoreKind::AgeFile { dir, identity, .. } => match keys.remove(&store.name) {
+                    Some(key) => backends.push(Arc::new(AgeFileBackend::new(dir, key)) as _),
+                    None => problems.push(format!("{}.", no_keys(&store.name, identity))),
+                },
+                kind => backends.push(build_kind(kind)),
+            }
+        }
+        for extra in keys.keys() {
+            problems.push(match self.store(extra) {
+                Some(store) => format!(
+                    "age keys were given for the store {extra}, which is a {} store and seals \
+                     nothing.",
+                    store.kind.name()
+                ),
+                None => {
+                    format!("age keys were given for {extra}, which is not a configured store.")
+                }
+            });
+        }
+        if problems.is_empty() {
+            Ok(RoutingBackend {
+                config: self,
+                backends,
+            })
+        } else {
+            Err(SecretConfigError::new(problems))
         }
     }
 }
@@ -649,12 +857,13 @@ fn check_store(
     problems: &mut Vec<String>,
 ) -> Option<StoreKind> {
     let line = format!("[secret.store.{name}]");
-    let settings: [(&str, bool); 9] = [
+    let settings: [(&str, bool); 10] = [
         ("write", table.write.is_some()),
         ("service", table.service.is_some()),
         ("label_prefix", table.label_prefix.is_some()),
         ("path", table.path.is_some()),
         ("identity", table.identity.is_some()),
+        ("recipients", table.recipients.is_some()),
         ("config", table.config.is_some()),
         ("profile", table.profile.is_some()),
         ("names", table.names.is_some()),
@@ -664,10 +873,11 @@ fn check_store(
         "keychain" => &["write", "service"],
         "secure-enclave" => &["write", "label_prefix"],
         "file" => &["write", "path"],
-        "age-file" | "fnox" => {
+        "age-file" => &["write", "path", "identity", "recipients"],
+        "fnox" => {
             problems.push(format!(
                 "`kind = {}` in {line} is not built yet in this release of ikigai-secret; use \
-                 keychain, secure-enclave or file until it lands.",
+                 keychain, secure-enclave, file or age-file until it lands.",
                 quoted(&table.kind)
             ));
             return None;
@@ -685,7 +895,12 @@ fn check_store(
     for (setting, present) in settings {
         if present && !reads.contains(&setting) {
             problems.push(format!(
-                "`{setting}` in {line} is not a setting of a {} store, which reads {}.",
+                "`{setting}` in {line} is not a setting of {} {} store, which reads {}.",
+                if table.kind.starts_with('a') {
+                    "an"
+                } else {
+                    "a"
+                },
                 table.kind,
                 words(reads)
             ));
@@ -710,6 +925,46 @@ fn check_store(
         None => None,
     };
     let kind = match table.kind.as_str() {
+        "age-file" => {
+            let identity = non_empty("identity", &table.identity, problems);
+            if table.identity.is_none() {
+                problems.push(format!(
+                    "{line} is an age-file store with no `identity`: name where the host gets the \
+                     age identity that opens its secrets, as `identity = \"file:/etc/ikigai/age\"`."
+                ));
+            }
+            let recipients = table.recipients.clone().unwrap_or_default();
+            for (index, recipient) in recipients.iter().enumerate() {
+                if let Err(why) = recipient_kind(recipient) {
+                    problems.push(format!(
+                        "entry {} of `recipients` in {line} {why}.",
+                        index + 1
+                    ));
+                }
+            }
+            let dir = match table.path.as_deref() {
+                Some(path) => store_dir(path, &line, home, problems),
+                None => {
+                    let dir = data_home_secrets(home);
+                    if dir.is_none() {
+                        problems.push(format!(
+                            "{line} has no `path`, so its directory would be the data home's \
+                             `secrets`, and the host has no home directory to read it under; give \
+                             an absolute path."
+                        ));
+                    }
+                    dir
+                }
+            };
+            match (dir, identity) {
+                (Some(dir), Some(identity)) => StoreKind::AgeFile {
+                    dir,
+                    identity,
+                    recipients,
+                },
+                _ => return None,
+            }
+        }
         "keychain" => StoreKind::Keychain {
             service: non_empty("service", &table.service, problems)
                 .unwrap_or_else(|| DEFAULT_SERVICE.to_string()),
@@ -907,6 +1162,15 @@ impl Backend for RoutingBackend {
         let backend = self.writable(name)?;
         backend.accepts_writes(name)
     }
+
+    /// Refused: a reencrypt names its store (`urn:secret:store:name:{store}:reencrypt`), which
+    /// asks that store's backend; the routing backend itself holds no items.
+    fn reencrypt(&self, may_write: &dyn Fn(&str) -> bool) -> Result<Reencrypted> {
+        let _ = may_write;
+        Err(Error::Conflict(
+            "reencrypt runs on one store, named in urn:secret:store:name:{store}:reencrypt".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -963,22 +1227,143 @@ mod tests {
     }
 
     #[test]
-    fn age_file_and_fnox_are_accepted_kinds_refused_as_not_built_yet() {
+    fn fnox_is_an_accepted_kind_refused_as_not_built_yet() {
         let problems = refused(
-            "default = \"a\"\n[store.a]\nkind = \"age-file\"\npath = \"~/s\"\nidentity = \"x\"\n\
-             [store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\nnames = \"map\"\n[store.f.map]\n\
-             \"a.b\" = \"A_B\"\n",
+            "default = \"f\"\n[store.f]\nkind = \"fnox\"\nconfig = \"/f.toml\"\nnames = \"map\"\n\
+             [store.f.map]\n\"a.b\" = \"A_B\"\n",
             Platform::Other,
         );
         assert_eq!(
             problems,
             [
-                "`kind = \"age-file\"` in [secret.store.a] is not built yet in this release of \
-                 ikigai-secret; use keychain, secure-enclave or file until it lands.",
                 "`kind = \"fnox\"` in [secret.store.f] is not built yet in this release of \
-                 ikigai-secret; use keychain, secure-enclave or file until it lands."
+              ikigai-secret; use keychain, secure-enclave, file or age-file until it lands."
             ]
         );
+    }
+
+    #[test]
+    fn an_age_file_store_reads_path_identity_and_recipients() {
+        let recipient = ikigai_encrypt::age::Identity::generate()
+            .to_public()
+            .to_string();
+        let text = format!(
+            "default = \"a\"\n[store.a]\nkind = \"age-file\"\npath = \"~/s\"\n\
+             identity = \"file:/etc/ikigai/age\"\nrecipients = [\"{recipient}\", \
+             \"age1yubikey1qwerty\"]\nwrite = false\n"
+        );
+        let config = SecretConfig::from_section_on(
+            Some(&section(&text)),
+            Some(Path::new("/home/svc")),
+            Platform::Other,
+        )
+        .unwrap();
+        let store = config.store("a").unwrap();
+        assert_eq!(
+            store.kind(),
+            &StoreKind::AgeFile {
+                dir: PathBuf::from("/home/svc/s"),
+                identity: "file:/etc/ikigai/age".into(),
+                recipients: vec![recipient, "age1yubikey1qwerty".into()],
+            }
+        );
+        assert!(store.read_only());
+        // No `path`: the data home's `secrets` directory under the host's home.
+        let bare = SecretConfig::from_section_on(
+            Some(&section(
+                "default = \"a\"\n[store.a]\nkind = \"age-file\"\nidentity = \"x\"\n",
+            )),
+            Some(Path::new("/home/svc")),
+            Platform::Other,
+        )
+        .unwrap();
+        assert!(matches!(
+            bare.store("a").unwrap().kind(),
+            StoreKind::AgeFile { dir, .. } if dir == Path::new("/home/svc/.ikigai/secrets")
+        ));
+    }
+
+    #[test]
+    fn an_age_file_store_without_identity_or_with_a_bad_recipient_is_refused() {
+        let problems = refused(
+            "default = \"a\"\n[store.a]\nkind = \"age-file\"\npath = \"/s\"\n\
+             recipients = [\"ssh-ed25519 AAAA\", \"age1notbech32\"]\nservice = \"x\"\n",
+            Platform::Other,
+        );
+        assert_eq!(
+            problems,
+            [
+                "`service` in [secret.store.a] is not a setting of an age-file store, which reads \
+                 write, path, identity and recipients.",
+                "[secret.store.a] is an age-file store with no `identity`: name where the host \
+                 gets the age identity that opens its secrets, as \
+                 `identity = \"file:/etc/ikigai/age\"`.",
+                "entry 1 of `recipients` in [secret.store.a] is not an age recipient: a recipient \
+                 begins with `age1`, as `age-keygen` and the age plugins print them.",
+                "entry 2 of `recipients` in [secret.store.a] is not a valid X25519 age recipient \
+                 (its checksum or length is wrong).",
+            ]
+        );
+        let homeless = SecretConfig::from_section_on(
+            Some(&section(
+                "default = \"a\"\n[store.a]\nkind = \"age-file\"\nidentity = \"x\"\n",
+            )),
+            None,
+            Platform::Other,
+        )
+        .unwrap_err();
+        assert_eq!(
+            homeless.problems(),
+            [
+                "[secret.store.a] has no `path`, so its directory would be the data home's \
+              `secrets`, and the host has no home directory to read it under; give an absolute \
+              path."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_section_keeps_an_existing_store_and_gives_a_new_install_age_file() {
+        let home = Some(Path::new("/home/svc"));
+        for platform in [Platform::Mac, Platform::Other] {
+            let existing =
+                SecretConfig::for_host_on(None, home, Found::Existing, platform).unwrap();
+            assert_eq!(
+                existing,
+                SecretConfig::from_section_on(None, home, platform).unwrap()
+            );
+            let notice = existing.notice().unwrap();
+            assert!(
+                notice.starts_with("ikigai-secret: secrets stay in the "),
+                "{notice}"
+            );
+            assert!(notice.contains("IKIGAI_SECRETS is deprecated"), "{notice}");
+            for found in [Found::Nothing, Found::AgeFile] {
+                let new = SecretConfig::for_host_on(None, home, found, platform).unwrap();
+                assert!(!new.is_configured());
+                assert_eq!(new.default_store(), "age-file");
+                assert_eq!(
+                    new.stores()[0].kind(),
+                    &StoreKind::AgeFile {
+                        dir: PathBuf::from("/home/svc/.ikigai/secrets"),
+                        identity: HOST_DEFAULT_IDENTITY.into(),
+                        recipients: Vec::new(),
+                    }
+                );
+                assert!(new.stores()[0].writable());
+                assert_eq!(new.notice(), None);
+            }
+        }
+        // A section always wins over what was found.
+        let configured =
+            SecretConfig::for_host_on(Some(&section(FILE)), home, Found::Nothing, Platform::Other)
+                .unwrap();
+        assert_eq!(configured.default_store(), "local");
+        assert_eq!(configured.notice(), None);
+        // A new install with no home to put its store under is refused, with the fix.
+        let homeless =
+            SecretConfig::for_host_on(None, None, Found::Nothing, Platform::Other).unwrap_err();
+        assert!(homeless.problems()[0].contains("set HOME"), "{homeless}");
     }
 
     #[test]

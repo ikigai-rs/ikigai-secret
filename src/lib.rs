@@ -66,16 +66,22 @@ use ikigai_core::{
     Representation, Result, UriTemplate, Verb,
 };
 
+mod age_file;
 mod file;
 mod inspect;
+mod ops;
 mod store;
+pub use age_file::{
+    AgeError, AgeFileBackend, AgeKeys, Reencrypted, X25519Keys, AGE_HEADER, HOST_DEFAULT_IDENTITY,
+};
 pub use file::FileBackend;
 pub use inspect::{
     INSPECT_SCOPE, ROUTE_IRI, ROUTE_SECRET_TEMPLATE, STORE_IRI, STORE_NAME_TEMPLATE,
 };
+pub use ops::REENCRYPT_TEMPLATE;
 pub use store::{
-    RouteSpec, RouteTable, Routed, RoutingBackend, SecretConfig, SecretConfigError, SecretSection,
-    StoreKind, StoreSpec, StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
+    Found, RouteSpec, RouteTable, Routed, RoutingBackend, SecretConfig, SecretConfigError,
+    SecretSection, StoreKind, StoreSpec, StoreTable, CONFIG_THREAD, DEFAULT_SERVICE, STORE_KINDS,
 };
 
 /// A secret store: get / set / delete a named secret's bytes. Implemented by the OS
@@ -162,6 +168,20 @@ pub trait Backend: Send + Sync {
     /// probes nothing. [`FileBackend`] judges its directory.
     fn health(&self) -> String {
         "not probed: this store is asked only when a request reaches it".to_string()
+    }
+
+    /// Encrypt this store's plaintext items in place: what
+    /// `urn:secret:store:name:{store}:reencrypt` runs, after every capability check and the
+    /// presence gate. Only an [`AgeFileBackend`] does anything; the default refuses as Conflict.
+    /// `may_write` says whether the caller holds the write scope of a secret name, and an item it
+    /// does not allow is neither read nor named. ⚠ A backend that WRAPS another must forward it.
+    fn reencrypt(&self, may_write: &dyn Fn(&str) -> bool) -> Result<Reencrypted> {
+        let _ = may_write;
+        Err(Error::Conflict(
+            "this store does not encrypt its items, so there is nothing to reencrypt; only an \
+             age-file store does"
+                .into(),
+        ))
     }
 }
 
@@ -300,6 +320,79 @@ pub fn default_backend() -> Arc<dyn Backend> {
     store::build_kind(store::platform_store().kind())
 }
 
+/// What a host with no `[secret]` section finds already on this machine, for
+/// [`SecretConfig::for_host`]: whether it is an install from before, which keeps its store, or a
+/// new one, which gets an `age-file` store (`docs/storage-backends.md`, section 9 decision 5).
+///
+/// Judged without reading any secret, in this order:
+///
+/// - `IKIGAI_SECRETS` set (it names the file store's directory): [`Found::Existing`]. An operator
+///   who chose a file store's place keeps a file store there.
+/// - The data home's `secrets` directory under `home` holds the age-file store's marker:
+///   [`Found::AgeFile`], the store an earlier start of a new install made.
+/// - It holds a secret and no marker: [`Found::Existing`], a file store from before.
+/// - On a Mac, any Keychain item under [`DEFAULT_SERVICE`] (attributes only, never a value):
+///   [`Found::Existing`].
+/// - Otherwise [`Found::Nothing`]: a new install.
+///
+/// `home` is the home directory the host resolved, as for [`SecretConfig::from_section`]. This
+/// reads the directory and (on a Mac) the Keychain, the stores this crate is the connector for;
+/// the configuration functions themselves read nothing.
+pub fn found_install(home: Option<&std::path::Path>) -> Result<Found> {
+    found_install_from(std::env::var_os("IKIGAI_SECRETS"), home, keychain_has_items)
+}
+
+/// [`found_install`] with the environment value and the Keychain probe passed in, so every
+/// branch is testable on every platform.
+pub(crate) fn found_install_from(
+    secrets_env: Option<std::ffi::OsString>,
+    home: Option<&std::path::Path>,
+    keychain: impl Fn(&str) -> Result<bool>,
+) -> Result<Found> {
+    if secrets_env.is_some_and(|value| !value.is_empty()) {
+        return Ok(Found::Existing);
+    }
+    if let Some(dir) = store::data_home_secrets(home) {
+        match file::dir_state(&dir)? {
+            file::DirState::AgeFile => return Ok(Found::AgeFile),
+            file::DirState::Plain => return Ok(Found::Existing),
+            file::DirState::Empty => {}
+        }
+    }
+    if keychain(DEFAULT_SERVICE)? {
+        return Ok(Found::Existing);
+    }
+    Ok(Found::Nothing)
+}
+
+/// Whether the Keychain holds any generic password under `service`: its attributes are asked
+/// for, never its data, so no item's access list is consulted. Off macOS there is no Keychain.
+fn keychain_has_items(service: &str) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::item::{ItemClass, ItemSearchOptions};
+        match ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(service)
+            .load_attributes(true)
+            .limit(1i64)
+            .search()
+        {
+            Ok(found) => Ok(!found.is_empty()),
+            // errSecItemNotFound: nothing under the service.
+            Err(e) if e.code() == -25300 => Ok(false),
+            Err(e) => Err(Error::Endpoint(format!(
+                "the Keychain could not be asked whether it holds ikigai secrets: {e}"
+            ))),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = service;
+        Ok(false)
+    }
+}
+
 /// The `urn:secret:*` space over `backend`, gated by the platform's [`BiometricGate`]. Mount
 /// it in a host kernel. [`space_with_gate`] is the same space with the gate injected.
 pub fn space(backend: Arc<dyn Backend>) -> EndpointSpace {
@@ -371,7 +464,15 @@ pub fn routed_space(routing: Arc<RoutingBackend>) -> EndpointSpace {
 ///   from the route table alone, never by asking a store. Under the name's own read scope,
 ///   `urn:cap:secret:read:<name>`.
 ///
-/// None of them ever names a path, an account, a token or a value. The names they are bound at
+/// And one operation, bound ahead of them:
+///
+/// - [`REENCRYPT_TEMPLATE`] (`urn:secret:store:name:{store}:reencrypt`, Sink): encrypt one
+///   `age-file` store's plaintext items in place, after a backup copy of its directory. Under the
+///   write scope of each item it rewrites (an item the caller may not write is neither read nor
+///   named), then the presence gate. One line per item, never a value.
+///
+/// None of them ever names a path, an account, a token or a value (the reencrypt answer names
+/// the backup it made, for the operator who ran it). The names they are bound at
 /// (`store`, `route`, and every name beginning `store:name:` or `route:secret:`) are never a
 /// secret's in this space, and generate refuses to mint into them.
 ///
@@ -422,6 +523,8 @@ fn secret_space(
             },
         );
     if let Some(routing) = routing {
+        // The store operations first: `urn:secret:store:name:{store}` would take their names.
+        space = ops::bind(space, Arc::clone(&routing), Arc::clone(&gate));
         space = inspect::bind(space, routing);
     }
     space.bind(
@@ -1237,6 +1340,60 @@ mod tests {
     use ikigai_core::{Capability, Request, Verb};
     use ikigai_resolve::Resolver;
     use std::path::PathBuf;
+
+    /// The new-install probe, every branch, with the Keychain injected (it cannot run here).
+    #[test]
+    fn found_install_tells_a_new_install_from_an_old_one() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let dir = home.join(".ikigai/secrets");
+        let no_keychain = |_: &str| -> Result<bool> { Ok(false) };
+        let keychain = |service: &str| -> Result<bool> { Ok(service == DEFAULT_SERVICE) };
+        let found = |env: Option<&str>, chain: &dyn Fn(&str) -> Result<bool>| {
+            found_install_from(env.map(Into::into), Some(home), chain).unwrap()
+        };
+        // Nothing anywhere: new.
+        assert_eq!(found(None, &no_keychain), Found::Nothing);
+        // An empty directory, or one with only hidden files (a leftover temporary file): new.
+        std::fs::create_dir_all(&dir).unwrap();
+        modes::set(&dir, modes::DIR).unwrap();
+        std::fs::write(dir.join(".tmp-0000000000000000"), b"x").unwrap();
+        assert_eq!(found(None, &no_keychain), Found::Nothing);
+        // Keychain items under the service: existing.
+        assert_eq!(found(None, &keychain), Found::Existing);
+        // `IKIGAI_SECRETS` set: existing; set but empty counts as unset.
+        assert_eq!(found(Some("/srv/secrets"), &no_keychain), Found::Existing);
+        assert_eq!(found(Some(""), &no_keychain), Found::Nothing);
+        // A plaintext secret and no marker: a file store from before.
+        FileBackend::new(&dir).set("api.token", b"t").unwrap();
+        assert_eq!(found(None, &no_keychain), Found::Existing);
+        // The marker: the age-file store a new install made, even beside a plaintext item.
+        file::mark_age_file(&dir).unwrap();
+        assert_eq!(found(None, &keychain), Found::AgeFile);
+        // A Keychain probe that fails is the host's refusal to start, not a guess.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let broken = |_: &str| -> Result<bool> { Err(Error::Endpoint("locked".into())) };
+        assert!(found_install_from(None, Some(home), broken).is_err());
+    }
+
+    /// The inverse of the file-name escape, and what it answers for a name it did not make.
+    #[test]
+    fn a_file_name_spells_back_its_secret_name() {
+        for name in [
+            "api.token",
+            "team:db",
+            "API-KEY",
+            "owner:id:acme:name:x",
+            "ünï",
+            "a%b",
+        ] {
+            assert_eq!(file::name_of(&file_name(name).unwrap()), name);
+        }
+        // Not the escape of any name: itself.
+        for file in ["LEGACY", "50%", "%zz", "%4", "%2E"] {
+            assert_eq!(file::name_of(file), file);
+        }
+    }
 
     /// Ledger #11: each endpoint has ONE name. The `Description` id (what the catalog and the
     /// MCP tool name carry) equals `Endpoint::name()` (what a conformance fixture keys on), so

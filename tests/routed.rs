@@ -22,9 +22,11 @@
 //!
 //! ## What is pinned
 //!
-//! - [`conforms`]: `ikigai-conformance` walks all seven endpoints of the routed space. `secret`
+//! - [`conforms`]: `ikigai-conformance` walks all eight endpoints of the routed space. `secret`
 //!   and `secret-store-name` (its health line is read now) are declared live; `secret-store`,
-//!   `secret-route` and `secret-route-secret` cacheable.
+//!   `secret-route` and `secret-route-secret` cacheable. `secret-store-reencrypt` (ledger #4488)
+//!   is a Sink with no `content`, so the walk fires it only under no grants; `tests/age_file.rs`
+//!   pins what it does.
 //! - [`every_inspection_resource_answers_under_its_narrow_grant`] and the JSON faces.
 //! - [`no_capability_check_is_skipped_on_any_routed_path`]: every verb, on a name routed to each
 //!   store and to the default, under no grants and under grants for other names: refused, and no
@@ -272,6 +274,7 @@ fn conforms() {
         .fixture(Fixture::new("secret", Verb::Delete).binding("name", "conformance"))
         .fixture(Fixture::new("secret-store-name", Verb::Source).binding("store", "local"))
         .fixture(Fixture::new("secret-route-secret", Verb::Source).binding("name", "zoom.x"))
+        .fixture(Fixture::new("secret-store-reencrypt", Verb::Sink).binding("store", "local"))
         .host_named_space(
             "ikigai_secret::routed_space_with_gate(routing, gate)",
             world.space.clone(),
@@ -280,8 +283,8 @@ fn conforms() {
     let report = suite.run_blocking(&world.kernel);
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_eq!(report.endpoints, 7, "{report}");
-    assert_eq!(report.actions, 10, "{report}");
+    assert_eq!(report.endpoints, 8, "{report}");
+    assert_eq!(report.actions, 11, "{report}");
     assert_eq!(
         report.checks.skipped().collect::<Vec<_>>(),
         Vec::<Check>::new(),
