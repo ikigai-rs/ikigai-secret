@@ -1,8 +1,8 @@
 # Configurable secret storage, and fnox both ways
 
 Design spike for ledger #3748 (fnox, both directions), widened to the ask behind it: configurable
-options for where secrets are stored, as soon as possible. Status: **proposed**. Nothing here is
-built; the decisions in section 9 are Brian's.
+options for where secrets are stored, as soon as possible. Status: **decided** (Brian, 2026-11-27;
+section 9). Nothing here is built yet; section 10's tasks are filed.
 
 References are to this repository at `b083c84` (0.5.1) and to fnox 1.50.0 (released 2026-11-18,
 MIT, <https://fnox.jdx.dev>, <https://github.com/jdx/fnox>). The fnox facts below were read from
@@ -214,10 +214,14 @@ so too.
 
 ## 8. Upgrade from older versions
 
-- **No `[secret]` section** (every install today): the host builds exactly what
-  `default_backend()` builds now, the Keychain on a Mac and the file store elsewhere, with
+- **No `[secret]` section, existing install** (every install today): the host builds exactly
+  what `default_backend()` builds now, the Keychain on a Mac and the file store elsewhere, with
   `IKIGAI_SECRETS` still honored for the file store's path, so nothing moves. A one-line notice
-  at start says the section exists and that `IKIGAI_SECRETS` is deprecated.
+  at start says `age-file` is now the default for new installs, how to move to it, and that
+  `IKIGAI_SECRETS` is deprecated. "Existing" is decided by what is there: a file store directory
+  with entries, or (on a Mac) any item under the `ikigai-secret` Keychain service.
+- **No `[secret]` section, new install:** an `age-file` store at the data home's
+  `secrets` directory, its identity held as `docs/unattended-unlock.md` says.
 - **Adding a section** never moves a secret. A name newly routed to another store is NotFound
   there until it is copied. Copying is an explicit operation,
   `urn:secret:store:name:{to}:copy from={store} name={name}`, under the name's read scope, the
@@ -230,26 +234,24 @@ so too.
 - Tests start the new code on a store written by 0.5.1 (and by 0.4.x, whose layout is the same)
   with no section, and with a section that routes some names elsewhere.
 
-## 9. Decisions for Brian
+## 9. Decisions (Brian, 2026-11-27)
 
 1. **Configuration in the config home**, `[secret]` with `store.*` tables and ordered `route`s,
-   as in section 5. Alternative: one store per host, no routes (simpler, but no per-owner or
-   per-team stores).
-2. **One store per name, no fallthrough** (section 3). Alternative: an ordered fallback chain,
-   which shadows silently.
-3. **fnox through its library for reads, its command for writes** (6.1, 6.2). Alternative: the
-   command for both (no dependency on fnox's crate and its 2024-edition, 1.91.1 floor, but every
-   read is a process and output parsing).
-4. **Where the connector lives:** a subcrate `crates/ikigai-secret-fnox` in this repository
-   (this repository becomes a workspace, like ikigai-events' bridges), or its own repository
-   (`ikigai-secret-fnox`, added to the repo map).
-5. **The Linux default once `age-file` exists:** keep `file` as the default with no section, or
-   make `age-file` the default for new installs only (old installs are never switched).
-6. **Name mapping for fnox stores:** an explicit `map` table by default, with the injective `escaped`
-   transform as the only alternative (6.1). A lossy transform (uppercase, every other character to
-   `_`) is ruled out: it lets one name read another's secret.
+   as in section 5. Accepted.
+2. **One store per name, no fallthrough** (section 3). Accepted.
+3. **fnox through its library for reads, its command for writes** (6.1, 6.2). Accepted.
+4. **The connector is a subcrate**, `crates/ikigai-secret-fnox` in this repository, which becomes
+   a workspace. Accepted.
+5. **`age-file` is the default store.** With no `[secret]` section, a NEW install (no store yet:
+   no Keychain items under the service and no file store directory) gets an `age-file` store, on
+   every platform. An existing install keeps the store it has, unchanged, until its operator
+   copies its secrets over (section 8); the host says once at start that `age-file` is now the
+   default and how to move. Where the age identity is held is the companion design,
+   `docs/unattended-unlock.md`.
+6. **Name mapping for fnox stores:** an explicit `map` table by default, with the injective
+   `escaped` transform as the only alternative (6.1). A lossy transform is ruled out. Accepted.
 
-## 10. Proposed tasks, in the order that gets configurable storage soonest
+## 10. Tasks, in the order that gets configurable storage soonest
 
 1. **Stores and routes in ikigai-secret** (no I/O in the crate: the host passes the parsed
    section). A `RoutingBackend` over named stores, the section's parser and its refusals,
