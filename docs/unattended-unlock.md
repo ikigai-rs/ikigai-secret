@@ -4,7 +4,7 @@ Design spike, the companion to `docs/storage-backends.md` (decided 2026-11-27: `
 default store for new installs). That note says each item is encrypted to an age recipient. This
 one says where the identity that decrypts them is held, so a service on a Mac, a Linux server or
 a rented VPS reads its secrets with nobody at the screen, and how an install moves there from the
-Keychain. Status: **proposed**. The decisions in section 8 are Brian's.
+Keychain. Status: **decided** (Brian, 2026-11-27, as proposed; section 8).
 
 Sources were read on 2026-11-27 and are named where used. A behavior no source documents is marked
 **(verify)**, with the test that settles it; nothing is built on an unverified one.
@@ -125,7 +125,7 @@ Each step is safe to stop after, and nothing is deleted until the last:
 5. **A VPS**: its `[secret]` section, the systemd unit with the credential, and a fnox store
    over a 1Password service account scoped to that host's vault.
 
-## 8. Decisions for Brian
+## 8. Decisions (Brian, 2026-11-27: all four as proposed)
 
 1. **The Mac identity:** Secure Enclave first (if section 6's test passes), with a dedicated
    YubiKey as the fallback.
